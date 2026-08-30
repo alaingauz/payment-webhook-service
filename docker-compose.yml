@@ -1,0 +1,51 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: webhooks
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d webhooks"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
+  migration:
+    build: .
+    command: ["node", "dist/database/migration-runner.js"]
+    environment:
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: webhooks
+      MIGRATIONS_DIR: /app/dist/database/migrations
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      MODE: api
+      PORT: "3000"
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: webhooks
+      DB_POOL_MAX: "10"
+      WEBHOOK_SECRET: dev-webhook-secret-change-me
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
