@@ -8,6 +8,27 @@
   = delivery_count + 1 RETURNING ...` para detectar duplicados sin SELECT previo
   y sin locks en memoria.
 
+- **FOR UPDATE SKIP LOCKED**: El worker reclama un evento pendiente usando
+  `SELECT ... FOR UPDATE SKIP LOCKED`, lo que permite que múltiples workers
+  compitan por eventos sin bloquearse mutuamente. Un evento solo puede ser
+  reclamado por un worker a la vez.
+
+- **Una transacción para orden, historial y evento**: Dentro de la misma
+  transacción se crea/bloquea la orden, se actualiza su estado, se inserta el
+  historial y se marca el evento como APPLIED o IGNORED. Si cualquier paso
+  falla, todo se revierte y el evento queda PENDING para reintentar.
+
+- **Índice único parcial en order_status_history(event_id)**: El índice
+  `uq_order_status_history_event_id` (WHERE event_id IS NOT NULL) actúa como
+  segunda defensa: incluso si un bug o condición de carrera permitiera procesar
+  el mismo evento dos veces, PostgreSQL rechazaría la segunda inserción de
+  historial. No afecta entradas de reconciliación (event_id NULL).
+
+- **Múltiples workers producen el mismo resultado**: Gracias a SKIP LOCKED, un
+  evento solo es procesado por un worker. Si un worker muere, PostgreSQL libera
+  el lock y otro worker puede tomar el evento. El resultado final es idéntico
+  independientemente de cuántos workers participen.
+
 - **La API confirma solamente después del COMMIT**: El endpoint responde HTTP 202
   únicamente después de que la transacción PostgreSQL haya hecho COMMIT. Si el
   proceso muere entre el COMMIT y la respuesta HTTP, el evento ya está persistido
@@ -17,11 +38,6 @@
   garantiza que ningún evento se pierde. El patrón durable inbox asegura que el
   evento sobrevive a caídas del proceso.
 
-- **El worker futuro podrá recuperarlo aunque la API muera**: Al tener el evento
-  en `webhook_events` con `processing_status = 'PENDING'`, un worker futuro puede
-  hacer polling de eventos pendientes y procesarlos independientemente del estado
-  de la API.
-
 - **La garantía es exactamente una vez sobre el efecto de negocio**: La
   idempotencia se logra a nivel de efecto de negocio (cada `event_id` se procesa
   una sola vez), no "exactly-once delivery" a nivel de red. Las re-entregas del
@@ -30,22 +46,55 @@
 
 ## 2. Caída a mitad del procesamiento
 
-- **503 ante fallo de PostgreSQL**: Si la transacción falla, se ejecuta ROLLBACK,
-  se libera el cliente en `finally`, y se responde 503 para que el proveedor
-  reintente. El evento no se pierde porque nunca se hizo durable.
+- **Antes de COMMIT, SIGKILL provoca rollback de PostgreSQL**: Si el worker
+  muere (SIGKILL) antes de ejecutar COMMIT, PostgreSQL detecta la conexión rota
+  y ejecuta un rollback automático. Los locks de fila se liberan, la orden no
+  cambia, el historial no se inserta y el evento permanece PENDING.
 
-- **COMMIT antes del 202**: Primero se hace COMMIT y solamente después se devuelve
-  el 202. Si el proceso muere después del COMMIT pero antes de la respuesta HTTP,
-  el evento ya está seguro en PostgreSQL y la siguiente entrega será un duplicado
-  idempotente.
+- **Los locks se liberan**: Al hacer rollback automático, PostgreSQL libera tanto
+  el lock `FOR UPDATE SKIP LOCKED` del evento como el lock `FOR UPDATE` de la
+  orden. Otro worker puede reclamar el evento inmediatamente.
 
-- **El worker futuro podrá recuperar eventos pendientes**: Los eventos con
-  `processing_status = 'PENDING'` quedan disponibles para un worker futuro que
-  los procese aunque la API haya muerto.
+- **El evento continúa PENDING**: Como el `processing_status` solo se actualiza
+  a APPLIED/IGNORED dentro de la misma transacción, un rollback garantiza que el
+  evento queda PENDING y disponible para reintentar.
+
+- **Después de COMMIT**: Una vez ejecutado el COMMIT, orden, historial y estado
+  del evento quedan persistidos de forma atómica. No existe ventana donde se
+  haya respondido 202 sin tener el evento en el durable inbox.
+
+- **No existe ventana sin durable inbox**: La API responde 202 solo después del
+  COMMIT de la ingesta. El worker procesa desde el inbox. En ambos caminos, el
+  efecto de negocio solo se materializa tras un COMMIT exitoso.
+
+- **503 ante fallo de PostgreSQL en la API**: Si la transacción de ingesta falla,
+  se ejecuta ROLLBACK, se libera el cliente en `finally`, y se responde 503 para
+  que el proveedor reintente.
 
 ## 3. Desorden
 
-Pendiente de implementar en una fase posterior.
+- **sequence es autoritativa**: El campo `sequence` del evento determina el orden
+  lógico. No se usa `occurred_at` como criterio principal porque los relojes del
+  proveedor podrían no ser monotónicos.
+
+- **Mayor sequence proyecta directamente el estado**: Si el evento tiene un
+  `sequence` mayor que `order.last_sequence`, se aplica el estado destino
+  directamente, sin exigir que la transición sea adyacente. Ejemplo: un salto
+  directo de `pending` a `refunded` es válido si `sequence` es mayor.
+
+- **Menor o igual se ignora con STALE_SEQUENCE**: Si el evento tiene un
+  `sequence` menor o igual al `last_sequence` actual de la orden, se marca como
+  IGNORED con `outcome_reason = 'STALE_SEQUENCE'`. No se modifica la orden.
+
+- **No se exige transición adyacente**: Los saltos de estado son válidos. El
+  sistema tolera que lleguen eventos desordenados o que se pierdan algunos
+  intermedios. El último estado con el mayor sequence prevalece.
+
+- **Alternativas descartadas**:
+  - Esperar eventos faltantes: aumenta complejidad y latencia, requiere timeouts
+    y manejo de eventos que nunca llegan.
+  - Usar `occurred_at` como orden principal: los relojes del proveedor no son
+    confiables y podrían generar conflictos con timestamps idénticos.
 
 ## 4. Reintentos
 
@@ -59,7 +108,28 @@ Pendiente de implementar en una fase posterior.
 
 ## 6. Escala
 
-Pendiente de implementar en una fase posterior.
+- **SKIP LOCKED permite múltiples workers**: Cada worker ejecuta
+  `SELECT ... FOR UPDATE SKIP LOCKED`, lo que permite que varios workers
+  procesen eventos en paralelo sin bloquearse entre sí. Se escala con
+  `docker compose up -d --scale worker=3`.
+
+- **Un event_id caliente se serializa por el contador de entregas**: Si el mismo
+  evento llega múltiples veces, el upsert en `webhook_events` serializa las
+  entregas por el lock de fila. Solo la primera entrega queda PENDING; las
+  siguientes incrementan `delivery_count` y se responden como DUPLICATE.
+
+- **Eventos de la misma orden se serializan mediante el lock de orders**: Al
+  usar `SELECT ... FROM orders WHERE id = $1 FOR UPDATE`, dos workers que
+  procesen eventos de la misma orden se serializan. Solo uno avanza a la vez,
+  garantizando consistencia del estado.
+
+- **Primer límite probable: PostgreSQL/pool y escrituras de auditoría**: Con
+  múltiples workers, el cuello de botella será el pool de conexiones y la
+  velocidad de escritura en `order_status_history` y `webhook_events`. Para
+  escalar más allá, se podría particionar por `order_id` o usar réplicas de
+  lectura.
+
+- **Reintentos**: Pendiente para Fase 4.
 
 ## Decisiones adicionales de recepción
 

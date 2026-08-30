@@ -47,5 +47,21 @@ services:
       migration:
         condition: service_completed_successfully
 
+  worker:
+    build: .
+    environment:
+      MODE: worker
+      DB_HOST: postgres
+      DB_PORT: "5432"
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: webhooks
+      DB_POOL_MAX: "10"
+      WORKER_POLL_INTERVAL_MS: "100"
+      WORKER_ERROR_DELAY_MS: "500"
+    depends_on:
+      migration:
+        condition: service_completed_successfully
+
 volumes:
   pgdata:
