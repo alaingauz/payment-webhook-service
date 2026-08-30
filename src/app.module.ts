@@ -5,6 +5,7 @@ import { AppService } from './app.service.js';
 import { databaseConfig } from './config/database.config.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
+import { WebhooksModule } from './webhooks/webhooks.module.js';
 
 @Module({
   imports: [
@@ -14,6 +15,7 @@ import { HealthModule } from './health/health.module.js';
     }),
     DatabaseModule,
     HealthModule,
+    WebhooksModule,
   ],
   controllers: [AppController],
   providers: [AppService],

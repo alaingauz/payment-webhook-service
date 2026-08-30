@@ -5,7 +5,7 @@ async function bootstrap() {
   const mode = process.env['MODE'] ?? 'api';
 
   if (mode === 'api') {
-    const app = await NestFactory.create(AppModule);
+    const app = await NestFactory.create(AppModule, { rawBody: true });
     app.enableShutdownHooks();
     const port = process.env['PORT'] ?? 3000;
     await app.listen(port);

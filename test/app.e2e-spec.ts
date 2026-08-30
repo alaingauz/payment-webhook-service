@@ -8,6 +8,14 @@ import { PG_POOL } from './../src/database/database.module.js';
 describe('AppController (e2e)', () => {
   let app: INestApplication<App>;
 
+  beforeAll(() => {
+    process.env['WEBHOOK_SECRET'] = 'test-secret';
+  });
+
+  afterAll(() => {
+    delete process.env['WEBHOOK_SECRET'];
+  });
+
   const mockPool = {
     query: vi.fn(),
     on: vi.fn(),
