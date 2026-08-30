@@ -25,6 +25,9 @@ export interface OrderEventRow {
   attempt_count: number;
   delivery_count: number;
   processed_at: Date | null;
+  next_attempt_at: Date | null;
+  last_error: string | null;
+  replay_count: number;
 }
 
 export interface StatusChangeRow {
@@ -70,7 +73,8 @@ export class OrdersRepository {
 
       const eventsResult = await client.query<OrderEventRow>(
         `SELECT event_id, event_type, sequence, occurred_at, received_at,
-                processing_status, outcome_reason, attempt_count, delivery_count, processed_at
+                processing_status, outcome_reason, attempt_count, delivery_count, processed_at,
+                next_attempt_at, last_error, replay_count
          FROM webhook_events
          WHERE order_id = $1
          ORDER BY received_at, id`,

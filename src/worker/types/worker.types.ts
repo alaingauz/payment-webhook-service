@@ -7,6 +7,8 @@ export interface ClaimedEvent {
   occurred_at: Date;
   payload: Record<string, unknown>;
   correlation_id: string;
+  attempt_count: number;
+  next_attempt_at: Date | null;
 }
 
 export type OrderStatus = 'pending' | 'authorized' | 'captured' | 'refunded' | 'failed';

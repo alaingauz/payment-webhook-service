@@ -71,6 +71,19 @@
   se ejecuta ROLLBACK, se libera el cliente en `finally`, y se responde 503 para
   que el proveedor reintente.
 
+- **Antes de programar retry**: Si el worker muere después del claim pero antes
+  de ejecutar `ROLLBACK TO SAVEPOINT` o el UPDATE de `RETRY_SCHEDULED`, PostgreSQL
+  detecta la conexión rota y hace rollback automático. El evento permanece en su
+  estado previo (PENDING o RETRY_SCHEDULED) y otro worker lo reclamará.
+
+- **Después de programar retry**: Si el worker muere después del COMMIT que marcó
+  el evento como `RETRY_SCHEDULED`, el evento queda correctamente programado con
+  `next_attempt_at`. Otro worker lo reclamará cuando venza la fecha.
+
+- **Durante replay**: El replay usa `SELECT ... FOR UPDATE` con transacción.
+  Si el proceso muere antes del COMMIT, PostgreSQL revierte y el evento permanece
+  en DLQ. El administrador puede reintentar el replay.
+
 ## 3. Desorden
 
 - **sequence es autoritativa**: El campo `sequence` del evento determina el orden
@@ -98,7 +111,51 @@
 
 ## 4. Reintentos
 
-Pendiente de implementar en una fase posterior.
+- **SAVEPOINT protege solamente el bloque de negocio**: Después de reclamar el
+  evento con `SELECT ... FOR UPDATE SKIP LOCKED` en la transacción exterior, se
+  crea `SAVEPOINT business_processing`. Si la lógica de negocio (crear orden,
+  actualizar estado, insertar historial, marcar evento) lanza una excepción, se
+  ejecuta `ROLLBACK TO SAVEPOINT` y `RELEASE SAVEPOINT`, deshaciendo cualquier
+  efecto parcial sin perder el lock del evento.
+
+- **Casos deterministas no hacen rollback al SAVEPOINT**: Resultados como
+  `APPLIED`, `STALE_SEQUENCE` y `UNKNOWN_EVENT_TYPE` son deterministas y se
+  resuelven directamente con `RELEASE SAVEPOINT` seguido de `COMMIT`. Solo las
+  excepciones reales activan `ROLLBACK TO SAVEPOINT`.
+
+- **Fórmula `attemptCount - 1`**: El backoff exponencial usa
+  `cap = min(MAX_DELAY, BASE_DELAY * 2^(attemptCount - 1))`. Esto produce:
+  - attemptCount=1 → cap=BASE_DELAY
+  - attemptCount=2 → cap=BASE_DELAY×2
+  - attemptCount=3 → cap=BASE_DELAY×4
+  No se usa `2^attemptCount` para evitar duplicar incorrectamente el primer
+  retraso.
+
+- **Full jitter evita sincronización de varios workers**: El delay real es un
+  valor aleatorio uniforme entre 0 y cap (`delay = random() * cap`). Esto evita
+  que múltiples workers que fallaron simultáneamente reintenten al mismo tiempo,
+  distribuyendo la carga.
+
+- **Parámetros elegidos**: `WORKER_MAX_ATTEMPTS=5`, `WORKER_RETRY_BASE_MS=500`,
+  `WORKER_RETRY_MAX_MS=30000`. Con 5 intentos y base 500ms, los caps son
+  500ms, 1s, 2s, 4s. El max de 30s previene esperas excesivas. Estos valores
+  son configurables por variables de entorno y se validan al arrancar.
+
+- **Al agotarse intentos se usa PostgreSQL como DLQ**: Cuando
+  `attemptCount >= WORKER_MAX_ATTEMPTS`, el evento se marca como `DLQ` con
+  `outcome_reason = 'MAX_ATTEMPTS_EXHAUSTED'`. No se usa una cola externa;
+  PostgreSQL actúa como DLQ con índice parcial para consultas eficientes.
+
+- **Replay solo vuelve a PENDING; no procesa inline**: El endpoint
+  `POST /admin/dlq/:id/replay` resetea el evento a `PENDING` con
+  `attempt_count=0` e incrementa `replay_count`. No ejecuta la lógica de
+  negocio dentro del endpoint; el worker lo tomará posteriormente.
+
+- **Dos replays concurrentes se serializan con FOR UPDATE**: El replay usa
+  `SELECT ... FOR UPDATE` dentro de una transacción. Si dos requests llegan
+  simultáneamente, uno obtiene el lock y hace el replay; el otro espera,
+  observa que ya no está en DLQ y responde `NOT_IN_DLQ` sin modificar nada.
+  `replay_count` solo aumenta una vez.
 
 ## 5. Uso de IA
 
@@ -129,7 +186,22 @@ Pendiente de implementar en una fase posterior.
   escalar más allá, se podría particionar por `order_id` o usar réplicas de
   lectura.
 
-- **Reintentos**: Pendiente para Fase 4.
+- **Índice parcial por `next_attempt_at`**: El índice
+  `idx_webhook_events_retry_due` sobre `(next_attempt_at, id)` con condición
+  `WHERE processing_status = 'RETRY_SCHEDULED'` permite al worker localizar
+  reintentos vencidos eficientemente sin escanear toda la tabla.
+
+- **Hot spots de DLQ y auditoría**: Eventos en DLQ se acumulan en la tabla
+  `webhook_events`. El índice `idx_we_dlq` permite consultas paginadas
+  eficientes. Si el volumen de DLQ crece significativamente, se podría
+  particionar o archivar eventos antiguos.
+
+- **Primer componente que se rompería a 100× volumen**: A 100× volumen, el
+  cuello de botella sería el polling del worker (`SELECT ... FOR UPDATE SKIP
+  LOCKED`) compitiendo con muchos workers por los mismos eventos. Se resolvería
+  con particionamiento por `order_id` hash, colas dedicadas por rango de ID,
+  o migración a un broker de mensajes externo (Kafka/RabbitMQ). El segundo
+  límite serían las escrituras de auditoría en `order_status_history`.
 
 ## Decisiones adicionales de recepción
 

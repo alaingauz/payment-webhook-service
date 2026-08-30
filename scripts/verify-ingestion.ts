@@ -2,6 +2,9 @@
  * Verification script for webhook ingestion (Phase 2).
  * Requires the API running on localhost:3000 and PostgreSQL accessible.
  *
+ * IMPORTANT: Run with the API active and workers STOPPED, because this script
+ * verifies that the ingestion layer does not process orders inline.
+ *
  * Usage: tsx scripts/verify-ingestion.ts
  */
 
@@ -10,6 +13,7 @@ import pg from 'pg';
 
 const API_URL = process.env['API_URL'] ?? 'http://localhost:3000';
 const SECRET = process.env['WEBHOOK_SECRET'] ?? 'dev-webhook-secret-change-me';
+const RUN_PREFIX = `vi-${Date.now()}`;
 
 const DB_CONFIG = {
   host: process.env['DB_HOST'] ?? 'localhost',
@@ -93,18 +97,18 @@ async function main() {
   const pool = new pg.Pool(DB_CONFIG);
 
   try {
-    // Clean up any previous test data
-    await pool.query("DELETE FROM webhook_deliveries WHERE event_id LIKE 'verify-%'");
-    await pool.query("DELETE FROM webhook_events WHERE event_id LIKE 'verify-%'");
+    console.log(`🔧 Ingestion verification script (prefix: ${RUN_PREFIX})`);
+    console.log(`   API: ${API_URL}`);
+    console.log(`   Workers must be STOPPED for this test.\n`);
 
     // ══════════════════════════════════════════════════════════════
     // Test 1: Hot-key idempotency and contention test
     // ══════════════════════════════════════════════════════════════
     console.log('\n📋 Test 1: Hot-key idempotency and contention test (100 concurrent, same event_id)');
-    const hotKeyEventId = 'verify-hotkey-001';
+    const hotKeyEventId = `${RUN_PREFIX}-hotkey-001`;
     const hotKeyPayload = {
       event_id: hotKeyEventId,
-      order_id: 'order-verify-hotkey',
+      order_id: `${RUN_PREFIX}-order-hotkey`,
       event_type: 'payment.authorized',
       sequence: 1,
       occurred_at: new Date().toISOString(),
@@ -149,8 +153,8 @@ async function main() {
     // ══════════════════════════════════════════════════════════════
     console.log('\n📋 Test 2: Stale event');
     const stalePayload = {
-      event_id: 'verify-stale-001',
-      order_id: 'order-verify-stale',
+      event_id: `${RUN_PREFIX}-stale-001`,
+      order_id: `${RUN_PREFIX}-order-stale`,
       event_type: 'payment.pending',
       sequence: 0,
       occurred_at: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
@@ -166,7 +170,7 @@ async function main() {
 
     const { rows: staleEvents } = await pool.query(
       'SELECT processing_status, outcome_reason FROM webhook_events WHERE event_id = $1',
-      ['verify-stale-001'],
+      [stalePayload.event_id],
     );
     assert(
       staleEvents[0]?.processing_status === 'IGNORED',
@@ -182,8 +186,8 @@ async function main() {
     // ══════════════════════════════════════════════════════════════
     console.log('\n📋 Test 3: Invalid signature');
     const invalidPayload = {
-      event_id: 'verify-invalid-sig-001',
-      order_id: 'order-invalid',
+      event_id: `${RUN_PREFIX}-invalid-sig-001`,
+      order_id: `${RUN_PREFIX}-order-invalid`,
       event_type: 'payment.failed',
       sequence: 0,
       occurred_at: new Date().toISOString(),
@@ -195,7 +199,7 @@ async function main() {
 
     const { rows: invalidEvents } = await pool.query(
       'SELECT COUNT(*)::int AS count FROM webhook_events WHERE event_id = $1',
-      ['verify-invalid-sig-001'],
+      [invalidPayload.event_id],
     );
     assert(
       invalidEvents[0]?.count === 0,
@@ -204,7 +208,7 @@ async function main() {
 
     const { rows: invalidDeliveries } = await pool.query(
       'SELECT COUNT(*)::int AS count FROM webhook_deliveries WHERE event_id = $1',
-      ['verify-invalid-sig-001'],
+      [invalidPayload.event_id],
     );
     assert(
       invalidDeliveries[0]?.count === 0,
@@ -216,8 +220,8 @@ async function main() {
     // ══════════════════════════════════════════════════════════════
     console.log('\n📋 Test 4: Missing signature');
     const noSigPayload = {
-      event_id: 'verify-no-sig-001',
-      order_id: 'order-nosig',
+      event_id: `${RUN_PREFIX}-no-sig-001`,
+      order_id: `${RUN_PREFIX}-order-nosig`,
       event_type: 'payment.captured',
       sequence: 0,
       occurred_at: new Date().toISOString(),
@@ -229,7 +233,7 @@ async function main() {
 
     const { rows: noSigEvents } = await pool.query(
       'SELECT COUNT(*)::int AS count FROM webhook_events WHERE event_id = $1',
-      ['verify-no-sig-001'],
+      [noSigPayload.event_id],
     );
     assert(
       noSigEvents[0]?.count === 0,
@@ -238,7 +242,7 @@ async function main() {
 
     const { rows: noSigDeliveries } = await pool.query(
       'SELECT COUNT(*)::int AS count FROM webhook_deliveries WHERE event_id = $1',
-      ['verify-no-sig-001'],
+      [noSigPayload.event_id],
     );
     assert(
       noSigDeliveries[0]?.count === 0,
@@ -249,10 +253,10 @@ async function main() {
     // Test 5: Same event_id with different payload → REJECTED, original preserved
     // ══════════════════════════════════════════════════════════════
     console.log('\n📋 Test 5: Same event_id with different payload → REJECTED');
-    const rejectedEventId = 'verify-rejected-001';
+    const rejectedEventId = `${RUN_PREFIX}-rejected-001`;
     const originalPayload = {
       event_id: rejectedEventId,
-      order_id: 'order-rejected',
+      order_id: `${RUN_PREFIX}-order-rejected`,
       event_type: 'payment.authorized',
       sequence: 1,
       occurred_at: new Date().toISOString(),
@@ -291,13 +295,14 @@ async function main() {
     );
 
     // ══════════════════════════════════════════════════════════════
-    // Test 6: No orders created
+    // Test 6: No orders created by this ingestion run
     // ══════════════════════════════════════════════════════════════
-    console.log('\n📋 Test 6: No orders created');
+    console.log('\n📋 Test 6: No orders created by this ingestion run');
     const { rows: orders } = await pool.query(
-      "SELECT COUNT(*)::int AS count FROM orders WHERE id LIKE 'order-verify%' OR id LIKE 'order-rejected%' OR id LIKE 'order-invalid%' OR id LIKE 'order-nosig%'",
+      `SELECT COUNT(*)::int AS count FROM orders WHERE id LIKE $1`,
+      [`${RUN_PREFIX}-%`],
     );
-    assert(orders[0]?.count === 0, `No rows in orders table (got ${orders[0]?.count})`);
+    assert(orders[0]?.count === 0, `No orders created by this run (got ${orders[0]?.count})`);
 
     // ══════════════════════════════════════════════════════════════
     // Test 7: Representative burst test
@@ -309,8 +314,8 @@ async function main() {
     const uniquePayloads: { payload: Record<string, unknown>; bodyStr: string }[] = [];
     for (let i = 0; i < 800; i++) {
       const p = {
-        event_id: `verify-burst-${String(i).padStart(4, '0')}`,
-        order_id: `order-burst-${String(i).padStart(4, '0')}`,
+        event_id: `${RUN_PREFIX}-burst-${String(i).padStart(4, '0')}`,
+        order_id: `${RUN_PREFIX}-order-burst-${String(i).padStart(4, '0')}`,
         event_type: 'payment.authorized',
         sequence: 1,
         occurred_at: new Date().toISOString(),

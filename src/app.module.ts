@@ -1,5 +1,6 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { AdminModule } from './admin/admin.module.js';
 import { AppController } from './app.controller.js';
 import { AppService } from './app.service.js';
 import { databaseConfig } from './config/database.config.js';
@@ -18,6 +19,7 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
     HealthModule,
     WebhooksModule,
     OrdersModule,
+    AdminModule,
   ],
   controllers: [AppController],
   providers: [AppService],

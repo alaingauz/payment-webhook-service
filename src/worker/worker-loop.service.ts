@@ -1,5 +1,6 @@
 import { Injectable, Logger, OnApplicationBootstrap, OnApplicationShutdown } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
+import type { WorkerConfig } from '../config/worker.config.js';
 import { WorkerRepository } from './worker.repository.js';
 
 @Injectable()
@@ -15,14 +16,9 @@ export class WorkerLoopService implements OnApplicationBootstrap, OnApplicationS
     private readonly repository: WorkerRepository,
     private readonly config: ConfigService,
   ) {
-    this.pollIntervalMs = parseInt(
-      this.config.get<string>('WORKER_POLL_INTERVAL_MS') ?? '100',
-      10,
-    );
-    this.errorDelayMs = parseInt(
-      this.config.get<string>('WORKER_ERROR_DELAY_MS') ?? '500',
-      10,
-    );
+    const wc = this.config.get<WorkerConfig>('worker')!;
+    this.pollIntervalMs = wc.pollIntervalMs;
+    this.errorDelayMs = wc.errorDelayMs;
     this.workerId = `worker-${process.pid}`;
   }
 
@@ -71,6 +67,7 @@ export class WorkerLoopService implements OnApplicationBootstrap, OnApplicationS
         `[${this.workerId}] event_id=${result.event_id} order_id=${result.order_id} ` +
         `sequence=${result.sequence} outcome=${result.outcome} ` +
         `outcome_reason=${result.outcome_reason ?? 'null'} ` +
+        `attempt_count=${result.attempt_count ?? 0} ` +
         `correlation_id=${result.correlation_id}`,
       );
     }

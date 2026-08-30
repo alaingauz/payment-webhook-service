@@ -35,6 +35,9 @@ export class OrdersController {
           attempt_count: e.attempt_count,
           delivery_count: e.delivery_count,
           processed_at: e.processed_at,
+          next_attempt_at: e.next_attempt_at,
+          last_error: e.last_error,
+          replay_count: e.replay_count,
         })),
         status_changes: statusChanges.map((sc) => ({
           event_id: sc.event_id,

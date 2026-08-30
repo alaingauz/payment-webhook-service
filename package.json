@@ -21,7 +21,8 @@
     "test:debug": "vitest --inspect-brk --no-file-parallelism",
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "verify:ingestion": "tsx scripts/verify-ingestion.ts",
-    "verify:worker": "tsx scripts/verify-worker.ts"
+    "verify:worker": "tsx scripts/verify-worker.ts",
+    "verify:retries-dlq": "tsx scripts/verify-retries-dlq.ts"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

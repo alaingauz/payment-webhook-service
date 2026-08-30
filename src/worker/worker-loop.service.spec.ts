@@ -17,8 +17,13 @@ describe('WorkerLoopService', () => {
 
     const mockConfig = {
       get: vi.fn((key: string) => {
-        if (key === 'WORKER_POLL_INTERVAL_MS') return '50';
-        if (key === 'WORKER_ERROR_DELAY_MS') return '100';
+        if (key === 'worker') return {
+          pollIntervalMs: 50,
+          errorDelayMs: 100,
+          maxAttempts: 5,
+          retryBaseMs: 500,
+          retryMaxMs: 30000,
+        };
         return undefined;
       }),
     };
