@@ -155,39 +155,127 @@ curl http://localhost:3000/admin/dlq?limit=10
 curl -X POST http://localhost:3000/admin/reconcile
 ```
 
-## Ejecución de tests y verificaciones
+## Pruebas y verificación
+
+### 2. Instalar y validar el código
 
 ```bash
-# Tests unitarios
+npm ci
+npm run lint
+npm run build
 npm test
-
-# Tests E2E automatizados (usan un pool PG simulado; no requieren PostgreSQL real)
 npm run test:e2e
-
-# Tests del simulador
 npm run test:simulator
+docker compose config
 ```
 
-### Verificaciones contra Docker (requieren los servicios levantados)
+Resultados de referencia:
 
-Primero, levantar solo postgres, provider, migration y api **sin workers**:
+| Prueba | Resultado |
+|---|---|
+| Unit tests | 189 passed |
+| E2E tests | 44 passed |
+| Simulator tests | 42 passed |
+| Lint | 0 errores |
+| Build | exitoso |
+| Compose config | válido |
+
+Los tests E2E automatizados utilizan un pool de PostgreSQL simulado. Las
+verificaciones siguientes utilizan PostgreSQL real mediante Docker.
+
+### 3. Levantar el entorno con tres workers
+
+Asegurar que no exista una ejecución anterior:
 
 ```bash
-docker compose up --build -d postgres provider migration api
-npm run verify:ingestion
+docker compose down -v --remove-orphans
 ```
 
-Después, iniciar tres workers y ejecutar el resto de verificaciones:
+Construir y levantar todos los servicios:
 
 ```bash
-docker compose up -d --no-deps --scale worker=3 worker
+docker compose up --build -d --scale worker=3
+```
+
+Esperar hasta que Docker marque la API como saludable:
+
+```bash
+API_ID=$(docker compose ps -q api)
+
+until [ "$(docker inspect --format '{{.State.Health.Status}}' "$API_ID")" = "healthy" ]; do
+  echo "Esperando que Docker marque la API como healthy..."
+  sleep 1
+done
+
+sleep 3
+```
+
+Revisar los contenedores:
+
+```bash
+docker compose ps -a
+```
+
+Estado esperado:
+
+| Servicio | Estado |
+|---|---|
+| PostgreSQL | healthy |
+| Provider | healthy |
+| API | healthy |
+| Tres workers | running |
+| Migration | Exited (0) |
+
+> El servicio `migration` termina después de aplicar las migraciones.
+> `Exited (0)` representa una ejecución exitosa.
+
+### 4. Ejecutar las verificaciones con workers activos
+
+```bash
 npm run verify:worker
 npm run verify:retries-dlq
 npm run verify:reconciliation
 npm run verify:observability
 ```
 
-### Ráfaga sucia
+Resultados de referencia:
+
+| Verificación | Resultado |
+|---|---|
+| verify:worker | 36 passed, 0 failed |
+| verify:retries-dlq | 29 passed, 0 failed |
+| verify:reconciliation | 42 passed, 0 failed |
+| verify:observability | 14 passed, 0 failed |
+
+### 5. Verificar la ingesta sin workers
+
+La prueba de ingesta debe ejecutarse con los workers detenidos porque verifica
+que la API persiste los eventos sin procesarlos todavía.
+
+```bash
+docker compose stop worker
+npm run verify:ingestion
+```
+
+Resultado esperado:
+
+```
+Results: 22 passed, 0 failed
+```
+
+Después de la verificación, volver a levantar las tres réplicas:
+
+```bash
+docker compose up -d --no-deps --scale worker=3 worker
+```
+
+Confirmar que las tres estén activas:
+
+```bash
+docker compose ps worker
+```
+
+### 6. Prueba de ráfaga sucia
 
 ```bash
 npm run simulate -- \
@@ -197,34 +285,114 @@ npm run simulate -- \
   --seed=42
 ```
 
-### Ráfaga normal
+Criterios de aprobación:
 
-```bash
-npm run simulate
+| Métrica | Esperado |
+|---|---|
+| Pending events | 0 |
+| DLQ events | 0 |
+| Lost events | 0 |
+| Divergences | 0 |
+| Unexpected errors | 0 |
+| p95 HTTP latency | menor a 100 ms |
+
+El reporte debe finalizar con:
+
+```
+SUCCESS: all orders converged to expected state
 ```
 
-### Muerte súbita (SIGKILL)
-
-Mata con SIGKILL **todas** las réplicas activas del servicio worker y las
-reinicia conservando el mismo número de réplicas:
+Esta prueba puede ejecutarse tres veces consecutivas para verificar
+consistencia:
 
 ```bash
-npm run simulate -- --kill-at=2500
+for run in 1 2 3; do
+  echo "========== RÁFAGA 5000 · EJECUCIÓN $run =========="
+
+  npm run simulate -- \
+    --events=5000 \
+    --duplicate-rate=0.2 \
+    --shuffle \
+    --seed=42 || break
+done
 ```
 
-## Resultados reales obtenidos
+### 7. Prueba de muerte súbita
 
-| Prueba | p95 (ms) | Divergencias | Pérdidas |
-|---|---|---|---|
-| Ráfaga 1 (5000 eventos) | 69.98 | 0 | 0 |
-| Ráfaga 2 (5000 eventos) | 30.48 | 0 | 0 |
-| Ráfaga 3 (5000 eventos) | 30.38 | 0 | 0 |
-| Observabilidad posterior | 63.16 | 0 | 0 |
-| SIGKILL (`--kill-at=2500`) | 89.34 | 0 | **0** |
+Confirmar primero que existan tres workers activos:
 
-Tres ráfagas de 5000 eventos sin divergencias. La prueba SIGKILL eliminó las
-tres réplicas del worker simultáneamente y obtuvo: eventos pendientes 0,
-DLQ 0, eventos perdidos 0, divergencias 0, p95 89.34 ms — resultado PASS.
+```bash
+docker compose ps worker
+```
+
+Ejecutar la ráfaga con muerte súbita en la entrega 2500:
+
+```bash
+npm run simulate -- \
+  --events=5000 \
+  --duplicate-rate=0.2 \
+  --shuffle \
+  --seed=42 \
+  --kill-at=2500 \
+  --restart-delay-ms=1000
+```
+
+Durante la ejecución, el simulador:
+
+1. Detecta la cantidad de workers activos.
+2. Continúa enviando la ráfaga.
+3. Mata todas las réplicas con SIGKILL en la entrega 2500.
+4. Continúa enviando eventos mientras los workers están detenidos.
+5. Reinicia la misma cantidad de réplicas.
+6. Espera hasta que todos los eventos alcancen un estado terminal.
+7. Compara las órdenes contra `expected-states.json`.
+
+El reporte debe confirmar:
+
+| Métrica | Esperado |
+|---|---|
+| Workers killed | 3 |
+| Kill confirmed | YES |
+| Workers restarted | 3 |
+| Restart confirmed | YES |
+| Burst continued | YES |
+| Pending events | 0 |
+| DLQ events | 0 |
+| Lost events | 0 |
+| Divergences | 0 |
+| Unexpected errors | 0 |
+
+Y finalizar con:
+
+```
+PASS: sudden death test — convergence after SIGKILL
+SUCCESS: all orders converged to expected state
+```
+
+### 8. Restaurar archivos y limpiar Docker
+
+Las simulaciones actualizan los snapshots del proveedor. Restaurarlos antes de
+revisar Git:
+
+```bash
+git restore \
+  provider-simulator/data/provider-orders.json \
+  provider-simulator/data/expected-states.json
+```
+
+Detener el entorno y eliminar el volumen temporal:
+
+```bash
+docker compose down -v
+```
+
+Verificar que el clon permanezca limpio:
+
+```bash
+git status --short
+```
+
+Si no existe salida, no quedaron archivos modificados.
 
 ## Detener y limpiar
 
