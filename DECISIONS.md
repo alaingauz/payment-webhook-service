@@ -218,9 +218,32 @@
 
 ## 5. Uso de IA
 
-- **Junie** fue usado para implementación y generación inicial de pruebas.
-- **Codex** fue usado para diseño, revisión técnica y detección de riesgos.
-- El candidato revisó los cambios y ejecutó las verificaciones.
+- **Junie** fue usado para scaffolding, implementación, generación inicial de
+  pruebas y documentación.
+- **ChatGPT/Codex** fue usado para diseño, revisión técnica, detección de
+  riesgos y propuestas de arquitectura.
+- Las decisiones fueron verificadas ejecutando Docker y PostgreSQL reales. No
+  se aceptaron resultados declarados sin ejecución real.
+
+### Errores y propuestas incompletas detectadas
+
+- Scripts que enviaban `amount` como número cuando el DTO exigía string.
+- `worker_id` idéntico en todos los contenedores al no usar `HOSTNAME`.
+- `processing_started` emitido después del procesamiento en lugar de antes.
+- Afirmaciones incorrectas sobre `latency_ms` (se afirmaba que
+  `processing_latency` siempre era mayor que `ingest_latency`).
+- Archivos generados del simulador (`provider-simulator/data/`) que debieron
+  limpiarse tras las pruebas.
+
+### Cómo se detectaron
+
+- Ejecución de tests E2E automatizados (con pool PG simulado) y scripts
+  `verify:*` / simulaciones contra PostgreSQL real en Docker.
+- Ráfagas de 5000 eventos con el simulador y verificación de convergencia.
+- Revisión de logs estructurados (`docker compose logs`) para confirmar
+  campos y orden de emisión.
+- Revisión de código línea por línea y `git diff` entre iteraciones.
+- Verificación cruzada de métricas reportadas vs. datos en PostgreSQL.
 
 ## 6. Escala
 
@@ -245,6 +268,11 @@
   escalar más allá, se podría particionar por `order_id` o usar réplicas de
   lectura.
 
+- **`percentile_cont` sobre historial completo**: Las métricas de p95 usan
+  `percentile_cont(0.95)` sobre todas las filas de `webhook_deliveries` y
+  `webhook_events`. PostgreSQL y esta función sobre el historial completo
+  serían de los primeros cuellos de botella a escala.
+
 - **Índice parcial por `next_attempt_at`**: El índice
   `idx_webhook_events_retry_due` sobre `(next_attempt_at, id)` con condición
   `WHERE processing_status = 'RETRY_SCHEDULED'` permite al worker localizar
@@ -255,12 +283,15 @@
   eficientes. Si el volumen de DLQ crece significativamente, se podría
   particionar o archivar eventos antiguos.
 
-- **Primer componente que se rompería a 100× volumen**: A 100× volumen, el
-  cuello de botella sería el polling del worker (`SELECT ... FOR UPDATE SKIP
-  LOCKED`) compitiendo con muchos workers por los mismos eventos. Se resolvería
-  con particionamiento por `order_id` hash, colas dedicadas por rango de ID,
-  o migración a un broker de mensajes externo (Kafka/RabbitMQ). El segundo
-  límite serían las escrituras de auditoría en `order_status_history`.
+- **A 100× volumen**: Se considerarían las siguientes estrategias:
+  - Particionamiento de `webhook_events` y `webhook_deliveries` por fecha o
+    hash de `order_id`.
+  - Retención: archivar o eliminar particiones antiguas.
+  - Métricas preagregadas: un proceso batch que actualice contadores en una
+    tabla `metrics_cache` periódicamente, eliminando `percentile_cont` sobre
+    el historial completo.
+  - Eventualmente un broker de mensajes (Kafka/RabbitMQ) si el volumen lo
+    justifica, pero no se afirma que sean necesarios para el volumen del reto.
 
 - **Coste del snapshot completo**: La reconciliación descarga el snapshot
   completo del proveedor (`GET /provider/orders` sin `updated_since`). Para el
