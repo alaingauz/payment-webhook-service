@@ -32,6 +32,66 @@ export interface DeliveryBaseParams {
   correlation_id: string;
 }
 
+/**
+ * Single-statement CTE that upserts the event, determines the delivery
+ * result, and inserts the delivery record atomically.
+ *
+ * A single PostgreSQL statement is implicitly atomic — no explicit
+ * BEGIN/COMMIT is needed.  This reduces network round trips from 4
+ * (BEGIN → UPSERT → INSERT delivery → COMMIT) to 1, which directly
+ * lowers p95 latency under high concurrency.
+ */
+const UPSERT_AND_DELIVER_SQL = `
+WITH evt AS (
+  INSERT INTO webhook_events (
+    event_id, order_id, event_type, sequence, occurred_at,
+    payload, payload_hash, received_at, processing_status,
+    outcome_reason, processed_at, correlation_id
+  )
+  VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+  ON CONFLICT (event_id)
+  DO UPDATE SET
+    delivery_count = webhook_events.delivery_count + 1
+  RETURNING id, delivery_count, payload_hash, processing_status
+),
+resolved AS (
+  SELECT
+    id,
+    delivery_count,
+    payload_hash,
+    processing_status,
+    CASE
+      WHEN delivery_count = 1 AND $13::boolean THEN 'IGNORED'
+      WHEN delivery_count = 1 THEN 'CREATED'
+      WHEN payload_hash = $14 THEN 'DUPLICATE'
+      ELSE 'REJECTED'
+    END AS delivery_result
+  FROM evt
+),
+dlv AS (
+  INSERT INTO webhook_deliveries (
+    event_id, received_at, latency_ms, result, correlation_id
+  )
+  SELECT
+    $1,
+    $15::timestamptz,
+    GREATEST(0, EXTRACT(EPOCH FROM (clock_timestamp() - $15::timestamptz)) * 1000)::numeric(10,2),
+    delivery_result,
+    $16
+  FROM resolved
+)
+SELECT id, delivery_count, payload_hash, processing_status, delivery_result
+FROM resolved
+`;
+
+interface CteRow {
+  id: number;
+  delivery_count: number;
+  payload_hash: string;
+  processing_status: string;
+  delivery_result: string;
+}
+
 @Injectable()
 export class WebhookIngestionRepository {
   private readonly logger = new Logger(WebhookIngestionRepository.name);
@@ -41,81 +101,58 @@ export class WebhookIngestionRepository {
   ) {}
 
   /**
-   * Upserts the event and inserts the delivery record in a single transaction.
+   * Upserts the event and inserts the delivery record in a single SQL
+   * statement (CTE).  The statement is implicitly atomic so no explicit
+   * transaction management is required.
    *
-   * latency_ms is calculated **after** the upsert and immediately before
-   * inserting webhook_deliveries.  This means the stored metric includes
-   * pool-wait time, BEGIN, and the upsert itself (including any row-level
-   * contention on event_id).  The external HTTP measurement from the
-   * verification script remains the authoritative source for full
-   * round-trip latency.
+   * latency_ms is computed inside PostgreSQL using
+   * clock_timestamp() − received_at immediately before the delivery INSERT.
+   * It captures prior request processing, pool-wait time, the upsert, and
+   * row-level contention on event_id.  It does not include the delivery
+   * INSERT itself nor the HTTP response write.
    */
   async saveEventAndDelivery(
     event: EventInsertParams,
     deliveryBase: DeliveryBaseParams,
-    startTime: number,
-    resolveResult: (upsert: UpsertResult) => string,
   ): Promise<{ upsert: UpsertResult; deliveryResult: string }> {
-    const client = await this.pool.connect();
+    const isStale = event.processing_status === 'IGNORED';
+
     try {
-      await client.query('BEGIN');
-
-      const upsertResult = await client.query<UpsertResult>(
-        `INSERT INTO webhook_events (
-          event_id, order_id, event_type, sequence, occurred_at,
-          payload, payload_hash, received_at, processing_status,
-          outcome_reason, processed_at, correlation_id
-        )
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
-        ON CONFLICT (event_id)
-        DO UPDATE SET
-          delivery_count = webhook_events.delivery_count + 1
-        RETURNING id, delivery_count, payload_hash, processing_status`,
+      const { rows } = await this.pool.query<CteRow>(
+        UPSERT_AND_DELIVER_SQL,
         [
-          event.event_id,
-          event.order_id,
-          event.event_type,
-          event.sequence,
-          event.occurred_at,
-          event.payload,
-          event.payload_hash,
-          event.received_at,
-          event.processing_status,
-          event.outcome_reason,
-          event.processed_at,
-          event.correlation_id,
+          event.event_id,        // $1
+          event.order_id,        // $2
+          event.event_type,      // $3
+          event.sequence,        // $4
+          event.occurred_at,     // $5
+          event.payload,         // $6
+          event.payload_hash,    // $7
+          event.received_at,     // $8
+          event.processing_status, // $9
+          event.outcome_reason,  // $10
+          event.processed_at,    // $11
+          event.correlation_id,  // $12
+          isStale,               // $13 — is_stale flag
+          event.payload_hash,    // $14 — current payload hash for comparison
+          deliveryBase.received_at, // $15
+          deliveryBase.correlation_id, // $16
         ],
       );
 
-      const row = upsertResult.rows[0]!;
-      const deliveryResult = resolveResult(row);
+      const row = rows[0]!;
 
-      // Calculate latency AFTER the upsert, immediately before delivery insert
-      const latencyMs = Math.max(0, parseFloat((performance.now() - startTime).toFixed(2)));
+      const upsert: UpsertResult = {
+        id: row.id,
+        delivery_count: row.delivery_count,
+        payload_hash: row.payload_hash,
+        processing_status: row.processing_status,
+      };
 
-      await client.query(
-        `INSERT INTO webhook_deliveries (
-          event_id, received_at, latency_ms, result, correlation_id
-        )
-        VALUES ($1, $2, $3, $4, $5)`,
-        [
-          deliveryBase.event_id,
-          deliveryBase.received_at,
-          latencyMs,
-          deliveryResult,
-          deliveryBase.correlation_id,
-        ],
-      );
-
-      await client.query('COMMIT');
-
-      return { upsert: row, deliveryResult };
+      return { upsert, deliveryResult: row.delivery_result };
     } catch (err) {
-      await client.query('ROLLBACK').catch(() => {});
-      this.logger.error('Transaction failed', (err as Error).stack);
+      this.logger.error('Ingestion query failed', (err as Error).stack);
       throw err;
-    } finally {
-      client.release();
     }
   }
 }

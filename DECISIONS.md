@@ -67,9 +67,10 @@
   COMMIT de la ingesta. El worker procesa desde el inbox. En ambos caminos, el
   efecto de negocio solo se materializa tras un COMMIT exitoso.
 
-- **503 ante fallo de PostgreSQL en la API**: Si la transacción de ingesta falla,
-  se ejecuta ROLLBACK, se libera el cliente en `finally`, y se responde 503 para
-  que el proveedor reintente.
+- **503 ante fallo de PostgreSQL en la API**: Si la sentencia CTE de ingesta
+  falla, PostgreSQL revierte toda la sentencia automáticamente (transacción
+  implícita) y `pool.query` rechaza la promesa. Se responde 503 para que el
+  proveedor reintente.
 
 - **Antes de programar retry**: Si el worker muere después del claim pero antes
   de ejecutar `ROLLBACK TO SAVEPOINT` o el UPDATE de `RETRY_SCHEDULED`, PostgreSQL
@@ -83,6 +84,12 @@
 - **Durante replay**: El replay usa `SELECT ... FOR UPDATE` con transacción.
   Si el proceso muere antes del COMMIT, PostgreSQL revierte y el evento permanece
   en DLQ. El administrador puede reintentar el replay.
+
+- **Caída durante reconciliación y rollback atómico**: La reconciliación
+  completa se ejecuta dentro de una sola transacción PostgreSQL. Si el proceso
+  muere o cualquier operación falla, PostgreSQL hace rollback automático. No
+  quedan órdenes parcialmente reconciliadas: o se reparan todas o ninguna.
+  El `pg_advisory_xact_lock` se libera automáticamente con el rollback.
 
 ## 3. Desorden
 
@@ -102,6 +109,12 @@
 - **No se exige transición adyacente**: Los saltos de estado son válidos. El
   sistema tolera que lleguen eventos desordenados o que se pierdan algunos
   intermedios. El último estado con el mayor sequence prevalece.
+
+- **Protección contra snapshot atrasado del proveedor**: Si el `sequence` del
+  proveedor es menor que el `last_sequence` local, la orden no se modifica.
+  Se registra como `STALE_PROVIDER_SNAPSHOT` en `reconciliation_details`. Esto
+  protege contra un snapshot del proveedor que no refleja eventos recientes ya
+  procesados localmente. El proveedor nunca hace retroceder una orden.
 
 - **Alternativas descartadas**:
   - Esperar eventos faltantes: aumenta complejidad y latencia, requiere timeouts
@@ -203,6 +216,49 @@
   o migración a un broker de mensajes externo (Kafka/RabbitMQ). El segundo
   límite serían las escrituras de auditoría en `order_status_history`.
 
+- **Coste del snapshot completo**: La reconciliación descarga el snapshot
+  completo del proveedor (`GET /provider/orders` sin `updated_since`). Para el
+  volumen del reto esto es aceptable. A mayor escala se podría usar
+  `updated_since` con paginación, pero eso introduce riesgo de perder órdenes
+  si el filtro del proveedor es inexacto.
+
+- **Locks y advisory lock**: Cada orden se bloquea con `SELECT ... FOR UPDATE`
+  para evitar conflictos con workers que procesen eventos de la misma orden.
+  `pg_advisory_xact_lock(900000001)` serializa reconciliaciones concurrentes
+  entre múltiples instancias de la API, garantizando que dos ejecuciones
+  simultáneas producen el mismo estado final sin duplicar reparaciones.
+
+- **PostgreSQL sigue siendo suficiente**: Para el volumen del reto, PostgreSQL
+  maneja reconciliación, advisory locks y locks de fila sin problemas. No se
+  necesita un sistema de colas externo ni un coordinador distribuido.
+
+## Decisiones de reconciliación
+
+- **Snapshot completo como fuente de verdad**: Se usa el snapshot completo del
+  proveedor para evitar depender de filtros incrementales que podrían omitir
+  órdenes. El proveedor es la fuente autoritativa del estado final.
+
+- **No se mantiene transacción abierta durante HTTP**: El snapshot se descarga
+  antes de abrir la transacción PostgreSQL. Esto evita mantener locks de base
+  de datos durante una llamada HTTP potencialmente lenta, reduciendo contención.
+
+- **provider_sequence menor nunca retrocede la orden**: Si el proveedor reporta
+  un sequence menor que el local, se asume que el snapshot está desactualizado
+  y no se modifica la orden. Se registra como STALE_PROVIDER_SNAPSHOT.
+
+- **Segunda ejecución no cambia datos de negocio**: Una reconciliación repetida
+  con el mismo snapshot encuentra todas las órdenes como ALREADY_OK (excepto
+  las STALE). No ejecuta UPDATE ni inserta historial. Sí crea su propio
+  `reconciliation_run` y `reconciliation_details` para auditoría.
+
+- **Normalización monetaria sin Number**: Las comparaciones de amount usan
+  normalización string a 2 decimales (`"100" → "100.00"`) para evitar
+  imprecisiones de punto flotante. No se usa `Number` ni `parseFloat` para
+  dinero.
+
+- **BIGINT como string**: Los identificadores BIGINT (run_id) se devuelven
+  como strings para evitar pérdida de precisión en JSON.
+
 ## Decisiones adicionales de recepción
 
 ### Firma HMAC y seguridad
@@ -243,14 +299,39 @@
   Si no, se genera un UUID v4. Se devuelve en header y body de respuesta, y se
   persiste en ambas tablas.
 
-### Latencia almacenada
+### Latencia almacenada y optimización del p95
 
-- **Medición después del upsert**: `latency_ms` se calcula en el repositorio
-  después del upsert de `webhook_events` e inmediatamente antes de insertar
-  `webhook_deliveries`. La métrica almacenada representa el tiempo de ingesta
-  hasta el registro de la entrega, incluyendo espera del pool, BEGIN y upsert
-  (con posible contención por event_id).
+- **CTE atómico en lugar de transacción explícita**: La ingesta de webhooks usa
+  una única sentencia SQL con CTEs (`WITH evt AS (... INSERT ... ON CONFLICT ...),
+  resolved AS (...), dlv AS (... INSERT ...) SELECT ...`). Una sentencia
+  PostgreSQL individual ya es atómica, eliminando la necesidad de BEGIN/COMMIT.
+  Esto reduce los round trips de red de 4 (BEGIN → UPSERT → INSERT delivery →
+  COMMIT) a 1, lo cual baja significativamente el p95 bajo alta concurrencia.
 
-- **Medición externa como fuente autoritativa**: La medición HTTP del script de
-  verificación sigue siendo la fuente autoritativa para la latencia HTTP completa
-  de ida y vuelta.
+- **Pools diferenciados API vs worker**: La API usa `DB_POOL_MAX=40` para
+  soportar 100 requests concurrentes sin esperar conexiones. Cada worker usa
+  `DB_POOL_MAX=2` porque procesa una transacción a la vez. Con 3 workers el
+  total es 40 + 3×2 = 46 conexiones, dentro del límite de `max_connections=100`
+  de PostgreSQL (por defecto). Esto deja 54 conexiones teóricas libres, aunque
+  se debe reservar margen para migraciones, scripts de verificación y
+  administración.
+
+- **Causa raíz del p95 alto**: Con `--concurrency=100` y pool de 10 conexiones,
+  90 requests esperaban una conexión libre. Además, cada request requería 4
+  round trips (BEGIN, UPSERT, INSERT, COMMIT), multiplicando el tiempo bajo
+  contención. La combinación de pool insuficiente + round trips excesivos
+  producía p95 > 100 ms. Con `DB_POOL_MAX=40` el máximo potencial de solicitudes
+  en cola se reduce de 90 a 60; el CTE hace que cada conexión se libere más
+  rápido, logrando que la espera efectiva sea mínima.
+
+- **Latencia medida en PostgreSQL**: `latency_ms` se calcula dentro del CTE
+  usando `clock_timestamp() - received_at`. Se mide inmediatamente antes del
+  INSERT de `webhook_deliveries`, después del UPSERT y de la espera del pool.
+  No incluye la finalización del INSERT de la delivery en sí. La latencia HTTP
+  externa (medida por el simulador) sigue siendo la medición completa de ida y
+  vuelta.
+
+- **Sentencia CTE como transacción implícita**: Ya no existe ROLLBACK explícito
+  en la API. La sentencia CTE completa es una transacción implícita; si cualquier
+  operación falla, PostgreSQL revierte toda la sentencia y `pool.query` rechaza
+  la promesa. `pool.query` obtiene y libera internamente una conexión del pool.

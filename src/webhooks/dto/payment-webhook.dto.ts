@@ -7,7 +7,7 @@ import {
   IsDateString,
   ValidateNested,
   IsOptional,
-  IsNumber,
+  Matches,
   Length,
   MaxLength,
   IsDefined,
@@ -26,9 +26,9 @@ const ALLOWED_EVENT_TYPES = [
 
 export class PaymentWebhookDataDto {
   @IsOptional()
-  @IsNumber()
-  @Min(0)
-  amount?: number;
+  @IsString()
+  @Matches(/^(?:0|[1-9]\d{0,9})\.\d{2}$/)
+  amount?: string;
 
   @IsOptional()
   @IsString()

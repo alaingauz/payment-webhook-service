@@ -112,7 +112,7 @@ async function main() {
       event_type: 'payment.authorized',
       sequence: 1,
       occurred_at: new Date().toISOString(),
-      data: { amount: 500, currency: 'MXN' },
+      data: { amount: '500.00', currency: 'MXN' },
     };
 
     const hotKeyLatencies: number[] = [];
@@ -158,7 +158,7 @@ async function main() {
       event_type: 'payment.pending',
       sequence: 0,
       occurred_at: new Date(Date.now() - 10 * 60 * 1000).toISOString(),
-      data: { amount: 100, currency: 'USD' },
+      data: { amount: '100.00', currency: 'USD' },
     };
 
     const staleResult = await sendWebhook(stalePayload);
@@ -191,7 +191,7 @@ async function main() {
       event_type: 'payment.failed',
       sequence: 0,
       occurred_at: new Date().toISOString(),
-      data: { amount: 0, currency: 'USD' },
+      data: { amount: '0.00', currency: 'USD' },
     };
 
     const invalidResult = await sendWebhook(invalidPayload, { signature: 'a'.repeat(64) });
@@ -225,7 +225,7 @@ async function main() {
       event_type: 'payment.captured',
       sequence: 0,
       occurred_at: new Date().toISOString(),
-      data: { amount: 50, currency: 'EUR' },
+      data: { amount: '50.00', currency: 'EUR' },
     };
 
     const noSigResult = await sendWebhook(noSigPayload, { skipSign: true });
@@ -260,7 +260,7 @@ async function main() {
       event_type: 'payment.authorized',
       sequence: 1,
       occurred_at: new Date().toISOString(),
-      data: { amount: 999, currency: 'MXN' },
+      data: { amount: '999.00', currency: 'MXN' },
     };
 
     // First: create the event
@@ -271,7 +271,7 @@ async function main() {
     // Second: send with different payload (different amount)
     const alteredPayload = {
       ...originalPayload,
-      data: { amount: 1, currency: 'USD' },
+      data: { amount: '1.00', currency: 'USD' },
     };
     const rejectedResult = await sendWebhook(alteredPayload);
     assert(rejectedResult.status === 202, `REJECTED delivery returns 202 (got ${rejectedResult.status})`);
@@ -290,8 +290,8 @@ async function main() {
       `Original payload_hash preserved after REJECTED delivery`,
     );
     assert(
-      storedPayload?.amount === 999 || storedPayload?.data?.amount === 999,
-      `Original payload data preserved (amount=999)`,
+      storedPayload?.amount === '999.00' || storedPayload?.data?.amount === '999.00',
+      `Original payload data preserved (amount='999.00')`,
     );
 
     // ══════════════════════════════════════════════════════════════
@@ -319,7 +319,7 @@ async function main() {
         event_type: 'payment.authorized',
         sequence: 1,
         occurred_at: new Date().toISOString(),
-        data: { amount: 100 + i, currency: 'MXN' },
+        data: { amount: `${100 + i}.00`, currency: 'MXN' },
       };
       uniquePayloads.push({ payload: p, bodyStr: JSON.stringify(p) });
     }

@@ -5,7 +5,6 @@ import type { WebhookRequest } from './types/webhook-request.js';
 @Injectable()
 export class WebhookTimingMiddleware implements NestMiddleware {
   use(req: WebhookRequest, _res: Response, next: NextFunction): void {
-    req.webhookStartTime = performance.now();
     req.webhookReceivedAt = new Date();
     next();
   }

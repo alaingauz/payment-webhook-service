@@ -3,185 +3,142 @@ import { WebhookIngestionRepository } from './webhook-ingestion.repository.js';
 
 describe('WebhookIngestionRepository', () => {
   let repo: WebhookIngestionRepository;
-  let mockClient: {
-    query: ReturnType<typeof vi.fn>;
-    release: ReturnType<typeof vi.fn>;
-  };
-  let mockPool: { connect: ReturnType<typeof vi.fn> };
+  let mockPool: { query: ReturnType<typeof vi.fn> };
 
   const baseEvent = {
     event_id: 'evt-001',
     order_id: 'order-001',
     event_type: 'payment.authorized',
     sequence: 1,
-    occurred_at: new Date().toISOString(),
-    payload: '{"event_id":"evt-001"}',
+    occurred_at: '2024-01-01T00:00:00Z',
+    payload: '{"test":true}',
     payload_hash: 'abc123',
     received_at: new Date(),
     processing_status: 'PENDING',
     outcome_reason: null,
     processed_at: null,
-    correlation_id: 'corr-1',
+    correlation_id: 'corr-001',
   };
 
   const baseDelivery = {
     event_id: 'evt-001',
     received_at: new Date(),
-    correlation_id: 'corr-1',
+    correlation_id: 'corr-001',
   };
 
   beforeEach(() => {
-    mockClient = {
-      query: vi.fn(),
-      release: vi.fn(),
-    };
     mockPool = {
-      connect: vi.fn().mockResolvedValue(mockClient),
+      query: vi.fn(),
     };
     repo = new WebhookIngestionRepository(mockPool as any);
   });
 
-  it('should execute BEGIN, upsert, delivery insert, and COMMIT in order', async () => {
-    mockClient.query
-      .mockResolvedValueOnce(undefined) // BEGIN
-      .mockResolvedValueOnce({ rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING' }] }) // UPSERT
-      .mockResolvedValueOnce(undefined) // delivery INSERT
-      .mockResolvedValueOnce(undefined); // COMMIT
+  it('should execute a single CTE query containing UPSERT and delivery INSERT', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'CREATED' }],
+    });
 
-    const result = await repo.saveEventAndDelivery(
-      baseEvent,
-      baseDelivery,
-      performance.now() - 10,
-      () => 'CREATED',
-    );
+    const result = await repo.saveEventAndDelivery(baseEvent, baseDelivery);
 
     expect(result.upsert.delivery_count).toBe(1);
     expect(result.deliveryResult).toBe('CREATED');
-    expect(mockClient.query).toHaveBeenCalledTimes(4);
+    // Single query call — no BEGIN/COMMIT round trips
+    expect(mockPool.query).toHaveBeenCalledOnce();
 
-    // Verify order: BEGIN, UPSERT, DELIVERY INSERT, COMMIT
-    const calls = mockClient.query.mock.calls;
-    expect(calls[0]![0]).toBe('BEGIN');
-    expect(calls[1]![0]).toContain('INSERT INTO webhook_events');
-    expect(calls[2]![0]).toContain('INSERT INTO webhook_deliveries');
-    expect(calls[3]![0]).toBe('COMMIT');
-
-    expect(mockClient.release).toHaveBeenCalledOnce();
+    const sql = mockPool.query.mock.calls[0]![0] as string;
+    expect(sql).toContain('INSERT INTO webhook_events');
+    expect(sql).toContain('INSERT INTO webhook_deliveries');
   });
 
-  it('should not return before COMMIT', async () => {
-    const callOrder: string[] = [];
-
-    mockClient.query.mockImplementation(async (sql: string) => {
-      if (sql === 'BEGIN') { callOrder.push('BEGIN'); return undefined; }
-      if (typeof sql === 'string' && sql.includes('INSERT INTO webhook_events')) {
-        callOrder.push('UPSERT');
-        return { rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING' }] };
-      }
-      if (typeof sql === 'string' && sql.includes('INSERT INTO webhook_deliveries')) {
-        callOrder.push('DELIVERY');
-        return undefined;
-      }
-      if (sql === 'COMMIT') { callOrder.push('COMMIT'); return undefined; }
-      return undefined;
+  it('should compute latency_ms with clock_timestamp() and received_at inside SQL', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'CREATED' }],
     });
 
-    await repo.saveEventAndDelivery(
-      baseEvent,
-      baseDelivery,
-      performance.now() - 10,
-      () => 'CREATED',
-    );
+    await repo.saveEventAndDelivery(baseEvent, baseDelivery);
 
-    expect(callOrder).toEqual(['BEGIN', 'UPSERT', 'DELIVERY', 'COMMIT']);
+    const sql = mockPool.query.mock.calls[0]![0] as string;
+    expect(sql).toContain('clock_timestamp()');
+    expect(sql).toContain('$15::timestamptz');
+    // latency_ms is computed in SQL, not passed as a parameter
+    const params = mockPool.query.mock.calls[0]![1] as unknown[];
+    // Should have 16 params (no latency_ms param)
+    expect(params).toHaveLength(16);
+    // No param should be a pre-calculated latency number
+    // $15 is received_at (Date), $16 is correlation_id (string)
+    expect(params[14]).toBeInstanceOf(Date); // $15 = received_at
+    expect(typeof params[15]).toBe('string'); // $16 = correlation_id
   });
 
-  it('should ROLLBACK and release client on upsert error', async () => {
-    mockClient.query
-      .mockResolvedValueOnce(undefined) // BEGIN
-      .mockRejectedValueOnce(new Error('PG error')) // UPSERT fails
-      .mockResolvedValueOnce(undefined); // ROLLBACK
-
-    await expect(
-      repo.saveEventAndDelivery(baseEvent, baseDelivery, performance.now(), () => 'CREATED'),
-    ).rejects.toThrow('PG error');
-
-    // Check ROLLBACK was called
-    const rollbackCall = mockClient.query.mock.calls.find(
-      (call: unknown[]) => call[0] === 'ROLLBACK',
-    );
-    expect(rollbackCall).toBeDefined();
-    expect(mockClient.release).toHaveBeenCalledOnce();
-  });
-
-  it('should ROLLBACK and release client on delivery insert error', async () => {
-    mockClient.query
-      .mockResolvedValueOnce(undefined) // BEGIN
-      .mockResolvedValueOnce({ rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING' }] }) // UPSERT
-      .mockRejectedValueOnce(new Error('delivery insert error')) // delivery INSERT fails
-      .mockResolvedValueOnce(undefined); // ROLLBACK
-
-    await expect(
-      repo.saveEventAndDelivery(baseEvent, baseDelivery, performance.now(), () => 'CREATED'),
-    ).rejects.toThrow('delivery insert error');
-
-    const rollbackCall = mockClient.query.mock.calls.find(
-      (call: unknown[]) => call[0] === 'ROLLBACK',
-    );
-    expect(rollbackCall).toBeDefined();
-    expect(mockClient.release).toHaveBeenCalledOnce();
-  });
-
-  it('should release client even if ROLLBACK fails', async () => {
-    mockClient.query
-      .mockResolvedValueOnce(undefined) // BEGIN
-      .mockRejectedValueOnce(new Error('PG error')) // UPSERT fails
-      .mockRejectedValueOnce(new Error('ROLLBACK also fails')); // ROLLBACK fails
-
-    await expect(
-      repo.saveEventAndDelivery(baseEvent, baseDelivery, performance.now(), () => 'CREATED'),
-    ).rejects.toThrow('PG error');
-
-    expect(mockClient.release).toHaveBeenCalledOnce();
-  });
-
-  it('should calculate latency_ms after upsert using performance.now()', async () => {
-    // Mock performance.now to control timing
-    let callCount = 0;
-    const startTime = 1000;
-
-    // First call in the repository (after upsert) should return a later time
-    vi.spyOn(performance, 'now').mockImplementation(() => {
-      callCount++;
-      // The repository calls performance.now() after upsert to compute latency
-      return startTime + 42.5; // 42.5ms after startTime
+  it('should not accept resolveResult as a parameter (dead code removed)', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'CREATED' }],
     });
 
-    mockClient.query
-      .mockResolvedValueOnce(undefined) // BEGIN
-      .mockResolvedValueOnce({ rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING' }] }) // UPSERT
-      .mockResolvedValueOnce(undefined) // delivery INSERT
-      .mockResolvedValueOnce(undefined); // COMMIT
+    // saveEventAndDelivery only takes 2 params now
+    expect(repo.saveEventAndDelivery.length).toBe(2);
 
-    await repo.saveEventAndDelivery(
-      baseEvent,
-      baseDelivery,
-      startTime,
-      () => 'CREATED',
-    );
+    await repo.saveEventAndDelivery(baseEvent, baseDelivery);
+    expect(mockPool.query).toHaveBeenCalledOnce();
+  });
 
-    // Verify the delivery INSERT received the computed latency
-    const deliveryInsertCall = mockClient.query.mock.calls[2]!;
-    const deliveryParams = deliveryInsertCall[1] as unknown[];
-    const latencyMs = deliveryParams[2] as number;
+  it('delivery INSERT depends on resolved which depends on evt', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'CREATED' }],
+    });
 
-    // latency should be ~42.5 (performance.now() - startTime)
-    expect(latencyMs).toBe(42.5);
+    await repo.saveEventAndDelivery(baseEvent, baseDelivery);
 
-    // Verify performance.now was called AFTER the upsert (call index 2 = delivery insert)
-    // The upsert is call index 1, so performance.now must have been called after it
-    expect(callCount).toBeGreaterThanOrEqual(1);
+    const sql = mockPool.query.mock.calls[0]![0] as string;
+    // resolved references evt
+    expect(sql).toMatch(/resolved\s+AS\s*\(\s*SELECT[\s\S]*FROM\s+evt/);
+    // dlv references resolved
+    expect(sql).toMatch(/dlv\s+AS\s*\(\s*INSERT[\s\S]*FROM\s+resolved/);
+  });
 
-    vi.restoreAllMocks();
+  it('should return CREATED for new non-stale event via CTE CASE', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'CREATED' }],
+    });
+
+    const result = await repo.saveEventAndDelivery(baseEvent, baseDelivery);
+
+    expect(result.deliveryResult).toBe('CREATED');
+    // Verify isStale parameter ($13) is false for PENDING status
+    const params = mockPool.query.mock.calls[0]![1] as unknown[];
+    expect(params[12]).toBe(false); // isStale
+  });
+
+  it('should return IGNORED for stale event via CTE CASE', async () => {
+    const staleEvent = { ...baseEvent, processing_status: 'IGNORED' };
+
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: 'abc123', processing_status: 'IGNORED', delivery_result: 'IGNORED' }],
+    });
+
+    const result = await repo.saveEventAndDelivery(staleEvent, baseDelivery);
+
+    expect(result.deliveryResult).toBe('IGNORED');
+    // Verify isStale parameter ($13) is true for IGNORED status
+    const params = mockPool.query.mock.calls[0]![1] as unknown[];
+    expect(params[12]).toBe(true); // isStale
+  });
+
+  it('should return DUPLICATE when delivery_count > 1 and payload_hash matches', async () => {
+    mockPool.query.mockResolvedValueOnce({
+      rows: [{ id: 1, delivery_count: 2, payload_hash: 'abc123', processing_status: 'PENDING', delivery_result: 'DUPLICATE' }],
+    });
+
+    const result = await repo.saveEventAndDelivery(baseEvent, baseDelivery);
+
+    expect(result.deliveryResult).toBe('DUPLICATE');
+  });
+
+  it('should propagate errors from pool.query', async () => {
+    mockPool.query.mockRejectedValueOnce(new Error('PG error'));
+
+    await expect(
+      repo.saveEventAndDelivery(baseEvent, baseDelivery),
+    ).rejects.toThrow('PG error');
   });
 });

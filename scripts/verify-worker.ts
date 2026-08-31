@@ -57,7 +57,7 @@ function makePayload(
   orderId: string,
   eventType: string,
   sequence: number,
-  data: Record<string, unknown> = { amount: 1000, currency: 'MXN' },
+  data: Record<string, unknown> = { amount: '1000.00', currency: 'MXN' },
 ) {
   return {
     event_id: eventId,

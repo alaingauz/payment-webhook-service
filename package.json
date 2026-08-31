@@ -22,7 +22,10 @@
     "test:e2e": "vitest run --config ./vitest.config.e2e.ts",
     "verify:ingestion": "tsx scripts/verify-ingestion.ts",
     "verify:worker": "tsx scripts/verify-worker.ts",
-    "verify:retries-dlq": "tsx scripts/verify-retries-dlq.ts"
+    "verify:retries-dlq": "tsx scripts/verify-retries-dlq.ts",
+    "verify:reconciliation": "tsx scripts/verify-reconciliation.ts",
+    "test:simulator": "node --test provider-simulator/generator.test.js provider-simulator/server.test.js provider-simulator/convergence.test.js",
+    "simulate": "node provider-simulator/simulator.js"
   },
   "dependencies": {
     "@nestjs/common": "^12.0.1",

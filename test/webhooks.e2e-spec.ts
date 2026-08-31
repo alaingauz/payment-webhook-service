@@ -19,48 +19,34 @@ function makePayload(overrides: Record<string, unknown> = {}) {
     event_type: 'payment.authorized',
     sequence: 1,
     occurred_at: new Date().toISOString(),
-    data: { amount: 1000, currency: 'MXN' },
+    data: { amount: '1000.00', currency: 'MXN' },
     ...overrides,
   };
 }
 
 // Mock PG pool to avoid real DB in e2e tests
 function createMockPool() {
-  const mockClient = {
-    query: vi.fn(),
-    release: vi.fn(),
-  };
-
-  // Default: successful transaction
-  mockClient.query
-    .mockResolvedValueOnce(undefined) // BEGIN
-    .mockResolvedValueOnce({
-      rows: [{ id: 1, delivery_count: 1, payload_hash: '', processing_status: 'PENDING' }],
-    }) // UPSERT
-    .mockResolvedValueOnce(undefined) // delivery INSERT
-    .mockResolvedValueOnce(undefined); // COMMIT
-
   const pool = {
-    connect: vi.fn().mockResolvedValue(mockClient),
-    query: vi.fn().mockResolvedValue({ rows: [{ now: new Date() }] }),
+    // Default: successful CTE query returning CREATED
+    query: vi.fn().mockResolvedValue({
+      rows: [{ id: 1, delivery_count: 1, payload_hash: '', processing_status: 'PENDING', delivery_result: 'CREATED' }],
+    }),
     end: vi.fn().mockResolvedValue(undefined),
     on: vi.fn(),
   };
 
-  return { pool, mockClient };
+  return { pool };
 }
 
 describe('POST /webhooks/payments (e2e)', () => {
   let app: INestApplication;
   let mockPool: ReturnType<typeof createMockPool>['pool'];
-  let mockClient: ReturnType<typeof createMockPool>['mockClient'];
 
   beforeAll(async () => {
     process.env['WEBHOOK_SECRET'] = SECRET;
 
     const created = createMockPool();
     mockPool = created.pool;
-    mockClient = created.mockClient;
 
     const moduleRef = await Test.createTestingModule({
       imports: [AppModule],
@@ -82,27 +68,19 @@ describe('POST /webhooks/payments (e2e)', () => {
     upsertRow?: Record<string, unknown>;
     upsertError?: Error;
   }) {
-    mockClient.query.mockReset();
-    mockClient.release.mockReset();
-    mockPool.connect.mockResolvedValue(mockClient);
+    mockPool.query.mockReset();
 
     if (overrides?.upsertError) {
-      mockClient.query
-        .mockResolvedValueOnce(undefined) // BEGIN
-        .mockRejectedValueOnce(overrides.upsertError) // UPSERT fails
-        .mockResolvedValueOnce(undefined); // ROLLBACK
+      mockPool.query.mockRejectedValueOnce(overrides.upsertError);
     } else {
       const upsertRow = overrides?.upsertRow ?? {
         id: 1,
         delivery_count: 1,
         payload_hash: '',
         processing_status: 'PENDING',
+        delivery_result: 'CREATED',
       };
-      mockClient.query
-        .mockResolvedValueOnce(undefined) // BEGIN
-        .mockResolvedValueOnce({ rows: [upsertRow] }) // UPSERT
-        .mockResolvedValueOnce(undefined) // delivery INSERT
-        .mockResolvedValueOnce(undefined); // COMMIT
+      mockPool.query.mockResolvedValueOnce({ rows: [upsertRow] });
     }
   }
 
@@ -142,7 +120,8 @@ describe('POST /webhooks/payments (e2e)', () => {
       .set('X-Signature', 'a'.repeat(64))
       .send(body);
 
-    expect(mockPool.connect).not.toHaveBeenCalled();
+    // pool.query should not be called for the CTE when signature is invalid
+    expect(mockPool.query).not.toHaveBeenCalled();
   });
 
   it('should return 202 with valid signature', async () => {
@@ -169,7 +148,15 @@ describe('POST /webhooks/payments (e2e)', () => {
     const body = JSON.stringify(payload);
     const sig = sign(body);
 
-    resetMockClient();
+    resetMockClient({
+      upsertRow: {
+        id: 1,
+        delivery_count: 1,
+        payload_hash: '',
+        processing_status: 'IGNORED',
+        delivery_result: 'IGNORED',
+      },
+    });
 
     const res = await request(app.getHttpServer())
       .post('/webhooks/payments')
@@ -196,6 +183,7 @@ describe('POST /webhooks/payments (e2e)', () => {
         delivery_count: 2,
         payload_hash: payloadHash,
         processing_status: 'PENDING',
+        delivery_result: 'DUPLICATE',
       },
     });
 
@@ -315,6 +303,33 @@ describe('POST /webhooks/payments (e2e)', () => {
     expect(res.status).toBe(400);
   });
 
+  it('should accept simulator-format payload with string amount (contract compatibility)', async () => {
+    resetMockClient();
+    // Build payload matching the exact shape produced by generator.js
+    const payload = {
+      event_id: 'sim-compat-evt-00000001',
+      event_type: 'payment.captured',
+      order_id: 'sim-compat-order-000001',
+      sequence: 3,
+      occurred_at: new Date().toISOString(),
+      data: {
+        amount: '1234.50',
+        currency: 'MXN',
+      },
+    };
+    const rawBody = JSON.stringify(payload);
+    const signature = createHmac('sha256', SECRET).update(rawBody).digest('hex');
+
+    const res = await request(app.getHttpServer())
+      .post('/webhooks/payments')
+      .set('Content-Type', 'application/json')
+      .set('X-Signature', signature)
+      .send(rawBody);
+
+    expect(res.status).toBe(202);
+    expect(res.body.result).toBe('CREATED');
+  });
+
   it('should preserve original payload including extra fields', async () => {
     resetMockClient();
     const payload = {
@@ -323,7 +338,7 @@ describe('POST /webhooks/payments (e2e)', () => {
       event_type: 'payment.authorized',
       sequence: 1,
       occurred_at: new Date().toISOString(),
-      data: { amount: 1000, currency: 'MXN' },
+      data: { amount: '1000.00', currency: 'MXN' },
       extra_field: 'should_be_preserved',
     };
     const body = JSON.stringify(payload);
@@ -337,10 +352,10 @@ describe('POST /webhooks/payments (e2e)', () => {
 
     expect(res.status).toBe(202);
 
-    // Verify the upsert INSERT received the original JSON payload
-    const upsertCall = mockClient.query.mock.calls[1]!;
-    const upsertParams = upsertCall[1] as unknown[];
-    const storedPayload = upsertParams[5] as string;
+    // Verify the CTE query received the original JSON payload
+    const queryCall = mockPool.query.mock.calls[0]!;
+    const queryParams = queryCall[1] as unknown[];
+    const storedPayload = queryParams[5] as string;
     const parsed = JSON.parse(storedPayload) as Record<string, unknown>;
     expect(parsed['extra_field']).toBe('should_be_preserved');
   });

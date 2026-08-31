@@ -1,0 +1,11 @@
+{
+  "name": "provider-simulator",
+  "version": "1.0.0",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test generator.test.js",
+    "simulate": "node simulator.js"
+  }
+}

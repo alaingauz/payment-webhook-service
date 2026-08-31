@@ -1,9 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { createHash } from 'node:crypto';
-import {
-  WebhookIngestionRepository,
-  type UpsertResult,
-} from './webhook-ingestion.repository.js';
+import { WebhookIngestionRepository } from './webhook-ingestion.repository.js';
 
 const STALE_THRESHOLD_MS = 5 * 60 * 1000; // 5 minutes
 
@@ -26,7 +23,6 @@ export class WebhookIngestionService {
     validatedPayload: Record<string, unknown>,
     correlationId: string,
     receivedAt: Date,
-    startTime: number,
   ): Promise<IngestionResult> {
     const payloadHash = createHash('sha256').update(rawBody).digest('hex');
     const eventId = validatedPayload['event_id'] as string;
@@ -64,9 +60,6 @@ export class WebhookIngestionService {
         received_at: receivedAt,
         correlation_id: correlationId,
       },
-      startTime,
-      (upsert: UpsertResult) =>
-        this.determineResult(upsert, payloadHash, isStale),
     );
 
     return {
@@ -82,20 +75,4 @@ export class WebhookIngestionService {
     return occurredAt.getTime() < receivedAt.getTime() - STALE_THRESHOLD_MS;
   }
 
-  determineResult(
-    upsert: UpsertResult,
-    currentPayloadHash: string,
-    isStale: boolean,
-  ): DeliveryResult {
-    if (upsert.delivery_count === 1) {
-      return isStale ? 'IGNORED' : 'CREATED';
-    }
-
-    // delivery_count > 1
-    if (upsert.payload_hash === currentPayloadHash) {
-      return 'DUPLICATE';
-    }
-
-    return 'REJECTED';
-  }
 }

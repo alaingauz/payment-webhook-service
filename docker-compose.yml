@@ -29,6 +29,18 @@ services:
       postgres:
         condition: service_healthy
 
+  provider:
+    build: ./provider-simulator
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./provider-simulator/data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:4000/health || exit 1"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+
   api:
     build: .
     ports:
@@ -41,11 +53,21 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: webhooks
-      DB_POOL_MAX: "10"
+      DB_POOL_MAX: "40"
       WEBHOOK_SECRET: dev-webhook-secret-change-me
+      PROVIDER_BASE_URL: http://provider:4000
+      PROVIDER_TIMEOUT_MS: "5000"
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+      start_period: 2s
     depends_on:
       migration:
         condition: service_completed_successfully
+      provider:
+        condition: service_healthy
 
   worker:
     build: .
@@ -56,7 +78,7 @@ services:
       DB_USER: postgres
       DB_PASSWORD: postgres
       DB_NAME: webhooks
-      DB_POOL_MAX: "10"
+      DB_POOL_MAX: "2"
       WORKER_POLL_INTERVAL_MS: "100"
       WORKER_ERROR_DELAY_MS: "500"
       WORKER_MAX_ATTEMPTS: "5"

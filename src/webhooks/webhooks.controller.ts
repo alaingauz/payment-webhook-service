@@ -31,7 +31,6 @@ export class WebhooksController {
     @Req() req: WebhookRequest,
     @Res() res: Response,
   ): Promise<void> {
-    const startTime = req.webhookStartTime;
     const receivedAt = req.webhookReceivedAt;
 
     // Resolve correlation_id — handle string or string[] safely, apply trim
@@ -50,7 +49,6 @@ export class WebhooksController {
         validatedPayload,
         correlationId,
         receivedAt,
-        startTime,
       );
 
       res
