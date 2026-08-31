@@ -5,6 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { request } from 'node:http';
 import { generate, shuffle as shuffleArray, createRng } from './generator.js';
 import { checkOrderConvergence } from './convergence.js';
+import { createChaosCoordinator } from './docker-chaos.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const DATA_DIR = join(__dirname, 'data');
@@ -24,6 +25,8 @@ function parseArgs() {
     secret: 'dev-webhook-secret-change-me',
     timeoutMs: 60000,
     runId: '',
+    killAt: undefined,
+    restartDelayMs: 1000,
   };
 
   for (const arg of args) {
@@ -38,6 +41,8 @@ function parseArgs() {
     else if (arg.startsWith('--secret=')) opts.secret = arg.split('=').slice(1).join('=');
     else if (arg.startsWith('--timeout-ms=')) opts.timeoutMs = parseInt(arg.split('=')[1], 10);
     else if (arg.startsWith('--run-id=')) opts.runId = arg.split('=').slice(1).join('=');
+    else if (arg.startsWith('--kill-at=')) opts.killAt = parseInt(arg.split('=')[1], 10);
+    else if (arg.startsWith('--restart-delay-ms=')) opts.restartDelayMs = parseInt(arg.split('=')[1], 10);
   }
 
   return opts;
@@ -53,6 +58,10 @@ function validateArgs(opts) {
   if (typeof opts.invalidRate !== 'number' || isNaN(opts.invalidRate) || opts.invalidRate < 0 || opts.invalidRate > 1) errors.push('--invalid-rate must be between 0 and 1');
   if (typeof opts.staleRate !== 'number' || isNaN(opts.staleRate) || opts.staleRate < 0 || opts.staleRate > 1) errors.push('--stale-rate must be between 0 and 1');
   if (!opts.secret || opts.secret.trim() === '') errors.push('--secret must not be empty');
+  if (opts.killAt !== undefined) {
+    if (!Number.isInteger(opts.killAt) || opts.killAt <= 0) errors.push('--kill-at must be a positive integer');
+  }
+  if (!Number.isInteger(opts.restartDelayMs) || opts.restartDelayMs < 0) errors.push('--restart-delay-ms must be a non-negative integer');
   try {
     const u = new URL(opts.apiUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') errors.push('--api-url must be a valid HTTP URL');
@@ -186,6 +195,29 @@ async function main() {
     `${result.stats.invalidSignatures} invalid sigs, ${result.stats.staleTimestamps} stale timestamps, ` +
     `${result.stats.total} total, ${result.stats.orders} orders`);
 
+  // Validate kill-at against total deliveries (before writing data files)
+  if (opts.killAt !== undefined && opts.killAt > result.allEvents.length) {
+    console.error(`Invalid --kill-at=${opts.killAt}: exceeds total deliveries (${result.allEvents.length})`);
+    process.exit(1);
+  }
+
+  // Set up chaos coordinator if --kill-at is provided
+  let chaos = null;
+  let chaosReplicaCount = 0;
+  if (opts.killAt !== undefined) {
+    chaos = createChaosCoordinator({
+      killAt: opts.killAt,
+      restartDelayMs: opts.restartDelayMs,
+    });
+    try {
+      chaosReplicaCount = await chaos.preflight();
+      console.log(`Chaos mode: will kill ${chaosReplicaCount} worker(s) at delivery #${opts.killAt}`);
+    } catch (err) {
+      console.error(`Chaos preflight failed: ${err.message}`);
+      process.exit(1);
+    }
+  }
+
   // 2. Write data files atomically
   await atomicWrite(join(DATA_DIR, 'provider-orders.json'), result.providerOrders);
   await atomicWrite(join(DATA_DIR, 'expected-states.json'), result.expectedStates);
@@ -223,6 +255,11 @@ async function main() {
       sentCount++;
       if (sentCount % 500 === 0) {
         console.log(`  Sent ${sentCount}/${eventsToSend.length}...`);
+      }
+
+      // Notify chaos coordinator (non-blocking)
+      if (chaos) {
+        chaos.onDeliveryComplete(sentCount, chaosReplicaCount);
       }
 
       // Classify response
@@ -265,6 +302,12 @@ async function main() {
   console.log(`Sending ${eventsToSend.length} events with concurrency=${opts.concurrency}...`);
   await runWithConcurrency(tasks, opts.concurrency);
   console.log(`All ${eventsToSend.length} events sent.`);
+
+  // Wait for chaos cycle to complete if active
+  let chaosResult = null;
+  if (chaos) {
+    chaosResult = await chaos.waitForCompletion();
+  }
 
   // 5. Concurrent polling for order convergence
   console.log('Waiting for orders to converge...');
@@ -382,6 +425,16 @@ async function main() {
   console.log('\n══════════════════════════════════════');
   console.log('  SIMULATION REPORT');
   console.log('══════════════════════════════════════');
+  if (chaosResult) {
+    console.log('  ─── Sudden Death Test ───');
+    console.log(`  SIGKILL triggered at:    delivery #${chaosResult.killedAt}`);
+    console.log(`  Workers killed:          ${chaosResult.workersKilled}`);
+    console.log(`  Kill confirmed:          ${chaosResult.killConfirmed ? 'YES' : 'NO'}`);
+    console.log(`  Downtime:                ${chaosResult.downTimeMs}ms`);
+    console.log(`  Workers restarted:       ${chaosResult.workersRestarted}`);
+    console.log(`  Restart confirmed:       ${chaosResult.restartConfirmed ? 'YES' : 'NO'}`);
+    console.log(`  Burst continued:         ${chaosResult.burstContinued ? 'YES' : 'NO'}`);
+  }
   console.log(`  Total deliveries:      ${eventsToSend.length}`);
   console.log(`  Base events:           ${result.stats.base}`);
   console.log(`  Duplicates:            ${result.stats.duplicates}`);
@@ -451,6 +504,24 @@ async function main() {
   if (p95 >= 100) {
     console.error(`FAIL: p95 latency ${p95.toFixed(2)}ms >= 100ms`);
     exitCode = 1;
+  }
+
+  // Sudden death test result
+  if (opts.killAt !== undefined) {
+    if (!chaosResult) {
+      console.error('FAIL: sudden death test — chaos did not execute');
+      exitCode = 1;
+    } else if (!chaosResult.killConfirmed) {
+      console.error('FAIL: sudden death test — could not kill workers');
+      exitCode = 1;
+    } else if (!chaosResult.restartConfirmed) {
+      console.error('FAIL: sudden death test — could not restart workers');
+      exitCode = 1;
+    } else if (exitCode === 0) {
+      console.log('PASS: sudden death test — convergence after SIGKILL');
+    } else {
+      console.error('FAIL: sudden death test — convergence issues detected');
+    }
   }
 
   if (exitCode === 0) {

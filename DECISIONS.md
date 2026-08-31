@@ -91,6 +91,52 @@
   quedan órdenes parcialmente reconciliadas: o se reparan todas o ninguna.
   El `pg_advisory_xact_lock` se libera automáticamente con el rollback.
 
+### Prueba reproducible con SIGKILL
+
+- **La API confirma 2xx solamente después de persistir el durable inbox**: El
+  endpoint responde HTTP 202 únicamente después de que la sentencia CTE haya
+  hecho COMMIT implícito en PostgreSQL. El evento queda en el durable inbox
+  antes de que el cliente reciba la confirmación.
+
+- **Si el worker muere antes del COMMIT, PostgreSQL revierte la transacción y
+  libera el row lock al cerrarse la conexión**: El worker usa
+  `SELECT ... FOR UPDATE SKIP LOCKED` para reclamar eventos. Si recibe SIGKILL
+  antes de ejecutar COMMIT, PostgreSQL detecta la conexión rota, ejecuta
+  rollback automático y libera tanto el lock del evento como el lock de la
+  orden. No queda ningún efecto parcial.
+
+- **El evento continúa PENDING o RETRY_SCHEDULED y otro worker puede
+  reclamarlo**: Como el `processing_status` solo se actualiza a APPLIED/IGNORED
+  dentro de la misma transacción, un rollback garantiza que el evento permanece
+  en su estado previo. Otro worker lo reclamará en el siguiente ciclo de
+  polling.
+
+- **Si el worker muere después del COMMIT, el efecto ya quedó aplicado y el
+  evento está APPLIED o IGNORED**: Una vez ejecutado el COMMIT, orden,
+  historial y estado del evento quedan persistidos de forma atómica. La muerte
+  del worker después del COMMIT no tiene consecuencias sobre los datos.
+
+- **Nunca existe un estado confirmado solamente en memoria**: El patrón durable
+  inbox garantiza que todo efecto de negocio pasa por un COMMIT de PostgreSQL
+  antes de ser considerado confirmado. No se usan colas en memoria, caches ni
+  estados volátiles para decisiones de negocio.
+
+- **Los duplicados posteriores se absorben mediante event_id**: Si el proveedor
+  reenvía un evento después de la muerte del worker, el upsert en
+  `webhook_events` detecta el `event_id` existente e incrementa
+  `delivery_count`. Si el evento original ya fue procesado (APPLIED/IGNORED),
+  el duplicado no modifica nada. Si aún está PENDING, simplemente se registra
+  como DUPLICATE sin afectar el procesamiento pendiente.
+
+- **SIGKILL no ejecuta shutdown hooks, por lo que esta prueba es más fuerte
+  que una detención ordenada**: `docker compose kill -s SIGKILL` termina el
+  proceso inmediatamente sin ejecutar `SIGTERM` handlers, `process.on('exit')`,
+  ni ningún cleanup de NestJS. Esto simula el peor escenario posible: muerte
+  instantánea entre la respuesta HTTP 2xx y el procesamiento asíncrono del
+  worker. La prueba demuestra que incluso en este caso, todos los eventos
+  convergen al estado esperado gracias al durable inbox y los locks
+  transaccionales de PostgreSQL.
+
 ## 3. Desorden
 
 - **sequence es autoritativa**: El campo `sequence` del evento determina el orden
