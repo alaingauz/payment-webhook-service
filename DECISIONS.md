@@ -335,3 +335,101 @@
   en la API. La sentencia CTE completa es una transacción implícita; si cualquier
   operación falla, PostgreSQL revierte toda la sentencia y `pool.query` rechaza
   la promesa. `pool.query` obtiene y libera internamente una conexión del pool.
+
+## 7. Observabilidad: métricas y logs estructurados
+
+### Métricas derivadas de PostgreSQL
+
+- **Por qué PostgreSQL y no contadores en memoria**: Las métricas se calculan con
+  una consulta SQL sobre `webhook_events` y `webhook_deliveries`. Esto garantiza
+  que los valores sobreviven a reinicios de proceso y son consistentes entre
+  múltiples instancias de API. Los contadores en memoria se perderían al reiniciar
+  y divergirían entre réplicas. No se agrega Redis, Kafka ni prom-client porque
+  las métricas dependen directamente de los datos persistidos.
+
+- **`webhook_events_received_total`**: COUNT(*) de `webhook_deliveries`. Representa
+  entregas con HMAC válido. Las firmas inválidas se excluyen porque no se persisten
+  datos no confiables (el Guard rechaza con 401 sin ejecutar SQL).
+
+- **`webhook_duplicate_events_total`**: COUNT(*) de `webhook_deliveries` donde
+  `result = 'DUPLICATE'`. Permite monitorear la tasa de re-entregas del proveedor.
+
+- **`webhook_out_of_order_events_total`**: COUNT(*) de `webhook_events` donde
+  `outcome_reason = 'STALE_SEQUENCE'`. Indica eventos cuyo sequence era menor o
+  igual al `last_sequence` de la orden cuando el worker los procesó.
+
+- **`webhook_dlq_size`**: COUNT(*) de `webhook_events` donde
+  `processing_status = 'DLQ'`. Es un gauge porque puede decrementarse con replays.
+
+- **`webhook_ingest_latency_p95_ms`**: percentile_cont(0.95) sobre
+  `webhook_deliveries.latency_ms`. Se calcula inmediatamente antes del INSERT de
+  `webhook_deliveries` dentro del CTE atómico. Incluye procesamiento previo
+  (validación, Guard HMAC), espera por conexión del pool, upsert del evento y
+  contención. No incluye la ejecución final del INSERT de la delivery ni la
+  escritura de la respuesta HTTP.
+
+- **`webhook_processing_latency_p95_ms`**: percentile_cont(0.95) de
+  `EXTRACT(EPOCH FROM (processed_at - received_at)) * 1000` sobre eventos con
+  `processed_at IS NOT NULL` y `processing_status IN ('APPLIED', 'IGNORED')`.
+  Mide el tiempo total desde la recepción del webhook hasta que el worker completó
+  su procesamiento.
+
+- **`webhook_processing_latency_p95_ms` incluye espera en cola y procesamiento**:
+  Mide `processed_at - received_at`, que abarca el tiempo en cola (esperando a que
+  un worker reclame el evento) más el tiempo de procesamiento del worker. No se
+  debe afirmar que processing_latency siempre es mayor que ingest_latency, porque
+  un evento ignorado durante la ingesta por STALE_TIMESTAMP puede tener
+  `processed_at` igual a `received_at` (ambos se asignan en la misma sentencia CTE),
+  resultando en un processing_latency de 0 ms.
+
+- **Coste de ejecutar agregaciones sobre tablas crecientes**: Las consultas usan
+  COUNT(*) con filtros parciales y percentile_cont() que requieren escaneos. Los
+  índices parciales en migración 004 (`idx_wd_result_duplicate` y
+  `idx_we_outcome_stale_sequence`) aceleran los conteos filtrados. A medida que
+  las tablas crecen, el coste de las agregaciones aumentará.
+
+- **A 100× volumen**: Se necesitaría una de estas estrategias:
+  - Métricas preagregadas: un proceso batch que actualice contadores en una tabla
+    `metrics_cache` periódicamente.
+  - Retención: particionar `webhook_deliveries` y `webhook_events` por fecha y
+    archivar o eliminar particiones antiguas.
+  - Exporter dedicado: un proceso separado que lea las métricas con menor
+    frecuencia y las publique a un sistema de series temporales (Prometheus con
+    pushgateway o VictoriaMetrics).
+
+### Logs estructurados
+
+- **Estrategia de correlación API→worker**: El `correlation_id` se genera o recibe
+  en la API y se persiste en `webhook_events.correlation_id`. El worker lee este
+  campo al reclamar el evento y lo incluye en todos sus logs. Esto permite rastrear
+  el ciclo completo de un evento desde la recepción hasta el procesamiento con un
+  solo identificador.
+
+- **Una línea JSON por evento de dominio**: Los eventos de dominio (webhook.ingested,
+  worker.processing_started, etc.) se registran como JSON en una sola línea,
+  directamente a stdout (info/warn) o stderr (error), sin pasar por el Logger de
+  NestJS. Los logs de bootstrap y shutdown del framework pueden permanecer en su
+  formato original. Esto permite procesamiento directo por herramientas como `jq`,
+  Fluentd o CloudWatch Logs.
+
+- **worker_id único por instancia**: El worker resuelve su identificador con la
+  prioridad: variable de entorno `WORKER_ID` (si no vacía) → `HOSTNAME` (único por
+  contenedor Docker) → `worker-${process.pid}` como fallback. Esto garantiza que
+  `--scale worker=3` produzca tres identificadores distintos sin configuración
+  manual, ya que Docker asigna un HOSTNAME único a cada contenedor.
+
+- **Datos que deliberadamente no se registran**:
+  - `rawBody`: contiene el payload completo del proveedor.
+  - `payload`: datos de negocio del evento.
+  - `X-Signature` y `WEBHOOK_SECRET`: credenciales criptográficas.
+  - Contraseñas y URLs de PostgreSQL con credenciales.
+  - Datos completos del proveedor en reconciliación.
+  Los mensajes de error se sanitizan eliminando patrones de secretos y payloads
+  grandes antes de emitirlos.
+
+- **Campos protegidos**: Los campos `timestamp`, `level`, `service` y `event` no
+  pueden ser sobrescritos por datos del caller para evitar inyección de logs.
+
+- **Robustez**: Una falla al escribir un log nunca cambia el estado de negocio.
+  Los valores `undefined` se omiten silenciosamente. Los errores se serializan
+  de forma segura extrayendo solo `name` y `message` (sanitizado).

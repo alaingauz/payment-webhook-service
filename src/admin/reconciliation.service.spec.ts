@@ -12,6 +12,7 @@ import {
 } from '../provider/provider-client.js';
 import { ReconciliationRepository } from './reconciliation.repository.js';
 import type { ReconciliationRunResult } from './reconciliation.repository.js';
+import { StructuredLogger } from '../logging/structured-logger.js';
 
 function makeProviderClient(overrides: Partial<ProviderClient> = {}): ProviderClient {
   return {
@@ -51,7 +52,8 @@ describe('ReconciliationService', () => {
   beforeEach(() => {
     providerClient = makeProviderClient();
     repo = makeRepo();
-    service = new ReconciliationService(providerClient, repo);
+    const mockLogger = { info: vi.fn(), warn: vi.fn(), error: vi.fn(), setService: vi.fn() } as unknown as StructuredLogger;
+    service = new ReconciliationService(providerClient, repo, mockLogger);
   });
 
   it('fetches snapshot before calling repository', async () => {

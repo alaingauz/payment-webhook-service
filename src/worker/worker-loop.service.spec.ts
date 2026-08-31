@@ -1,12 +1,14 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { Test } from '@nestjs/testing';
 import { ConfigService } from '@nestjs/config';
+import { StructuredLogger } from '../logging/structured-logger.js';
 import { WorkerLoopService } from './worker-loop.service.js';
 import { WorkerRepository } from './worker.repository.js';
 
 describe('WorkerLoopService', () => {
   let service: WorkerLoopService;
   let mockRepository: { processOne: ReturnType<typeof vi.fn> };
+  let mockLogger: { setService: ReturnType<typeof vi.fn>; info: ReturnType<typeof vi.fn>; warn: ReturnType<typeof vi.fn>; error: ReturnType<typeof vi.fn> };
 
   beforeEach(async () => {
     vi.useFakeTimers();
@@ -28,11 +30,19 @@ describe('WorkerLoopService', () => {
       }),
     };
 
+    mockLogger = {
+      setService: vi.fn(),
+      info: vi.fn(),
+      warn: vi.fn(),
+      error: vi.fn(),
+    };
+
     const module = await Test.createTestingModule({
       providers: [
         WorkerLoopService,
         { provide: WorkerRepository, useValue: mockRepository },
         { provide: ConfigService, useValue: mockConfig },
+        { provide: StructuredLogger, useValue: mockLogger },
       ],
     }).compile();
 
@@ -130,5 +140,58 @@ describe('WorkerLoopService', () => {
 
     // Should have completed cleanly
     expect(mockRepository.processOne).toHaveBeenCalledTimes(1);
+  });
+
+  it('emits processing_started via onClaimed before business logic completes', async () => {
+    // processOne receives onClaimed callback and invokes it synchronously
+    // before doing business logic. We verify the callback triggers
+    // processing_started log BEFORE processing_completed.
+    mockRepository.processOne.mockImplementationOnce(async (onClaimed?: (info: unknown) => void) => {
+      // Simulate: claim event, then invoke onClaimed, then do business logic
+      if (onClaimed) {
+        onClaimed({
+          event_id: 'evt-1',
+          order_id: 'o-1',
+          correlation_id: 'c-1',
+          sequence: 1,
+        });
+      }
+      // Business logic would happen here, after onClaimed
+      return {
+        found: true,
+        event_id: 'evt-1',
+        order_id: 'o-1',
+        outcome: 'APPLIED',
+        outcome_reason: null,
+        correlation_id: 'c-1',
+        sequence: 1,
+        attempt_count: 0,
+        next_attempt_at: null,
+      };
+    }).mockResolvedValue({ found: false });
+
+    service.onApplicationBootstrap();
+    await vi.advanceTimersByTimeAsync(0);
+
+    const infoCalls = mockLogger.info.mock.calls.map((c: unknown[]) => c[0]);
+    const startedIdx = infoCalls.indexOf('worker.processing_started');
+    const completedIdx = infoCalls.indexOf('worker.processing_completed');
+
+    expect(startedIdx).toBeGreaterThanOrEqual(0);
+    expect(completedIdx).toBeGreaterThan(startedIdx);
+  });
+
+  it('emits worker.loop_error as structured log on tick failure', async () => {
+    mockRepository.processOne
+      .mockRejectedValueOnce(new Error('connection lost'))
+      .mockResolvedValue({ found: false });
+
+    service.onApplicationBootstrap();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(mockLogger.error).toHaveBeenCalledWith(
+      'worker.loop_error',
+      expect.objectContaining({ error_message: 'connection lost' }),
+    );
   });
 });

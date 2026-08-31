@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable } from '@nestjs/common';
 import pg from 'pg';
 import { PG_POOL } from '../database/database.module.js';
 import { PaymentEventProcessor } from './payment-event-processor.js';
@@ -8,6 +8,13 @@ import type { ClaimedEvent, OrderRow, ProcessingResult } from './types/worker.ty
 const { Pool } = pg;
 
 const MAX_ERROR_LENGTH = 2000;
+
+export interface ClaimedEventInfo {
+  event_id: string;
+  order_id: string;
+  correlation_id: string;
+  sequence: number;
+}
 
 export interface ProcessOneResult {
   found: boolean;
@@ -42,15 +49,13 @@ function sanitizeError(err: unknown): string {
 
 @Injectable()
 export class WorkerRepository {
-  private readonly logger = new Logger(WorkerRepository.name);
-
   constructor(
     @Inject(PG_POOL) private readonly pool: InstanceType<typeof Pool>,
     private readonly processor: PaymentEventProcessor,
     private readonly retryPolicy: RetryPolicy,
   ) {}
 
-  async processOne(): Promise<ProcessOneResult> {
+  async processOne(onClaimed?: (info: ClaimedEventInfo) => void): Promise<ProcessOneResult> {
     const client = await this.pool.connect();
     try {
       await client.query('BEGIN');
@@ -75,6 +80,20 @@ export class WorkerRepository {
       }
 
       const event = claimResult.rows[0]!;
+
+      // Notify observer that event has been claimed (before business logic)
+      if (onClaimed) {
+        try {
+          onClaimed({
+            event_id: event.event_id,
+            order_id: event.order_id,
+            correlation_id: event.correlation_id,
+            sequence: event.sequence,
+          });
+        } catch {
+          // Observability callback must never interrupt the transaction
+        }
+      }
 
       // SAVEPOINT protects the business logic block
       await client.query('SAVEPOINT business_processing');
@@ -176,13 +195,6 @@ export class WorkerRepository {
 
           await client.query('COMMIT');
 
-          this.logger.warn(
-            `DLQ event_id=${event.event_id} order_id=${event.order_id} ` +
-            `correlation_id=${event.correlation_id} ` +
-            `attempt_count=${decision.attemptCount} ` +
-            `error="${errorMessage}"`,
-          );
-
           return {
             found: true,
             event_id: event.event_id,
@@ -210,14 +222,6 @@ export class WorkerRepository {
 
           await client.query('COMMIT');
 
-          this.logger.warn(
-            `RETRY_SCHEDULED event_id=${event.event_id} order_id=${event.order_id} ` +
-            `correlation_id=${event.correlation_id} ` +
-            `attempt_count=${decision.attemptCount} ` +
-            `next_attempt_at=${decision.nextAttemptAt.toISOString()} ` +
-            `error="${errorMessage}"`,
-          );
-
           return {
             found: true,
             event_id: event.event_id,
@@ -236,13 +240,6 @@ export class WorkerRepository {
       await client.query('RELEASE SAVEPOINT business_processing');
       await client.query('COMMIT');
 
-      this.logger.log(
-        `event_id=${event.event_id} order_id=${event.order_id} ` +
-        `correlation_id=${event.correlation_id} sequence=${event.sequence} ` +
-        `outcome=${result.outcome} outcome_reason=${result.outcome_reason ?? 'null'} ` +
-        `attempt_count=${event.attempt_count}`,
-      );
-
       return {
         found: true,
         event_id: event.event_id,
@@ -257,7 +254,6 @@ export class WorkerRepository {
     } catch (err) {
       // Outer transaction failure (BEGIN, claim, SAVEPOINT, ROLLBACK TO, retry/DLQ update, COMMIT, connection)
       await client.query('ROLLBACK').catch(() => {});
-      this.logger.error('Worker transaction failed', (err as Error).stack);
       throw err;
     } finally {
       client.release();

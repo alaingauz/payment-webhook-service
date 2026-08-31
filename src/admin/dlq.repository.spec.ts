@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Test } from '@nestjs/testing';
 import { DlqRepository } from './dlq.repository.js';
 import { PG_POOL } from '../database/database.module.js';
+import { StructuredLogger } from '../logging/structured-logger.js';
 
 function createMockClient() {
   return {
@@ -32,6 +33,7 @@ describe('DlqRepository', () => {
       providers: [
         DlqRepository,
         { provide: PG_POOL, useValue: mockPool },
+        { provide: StructuredLogger, useValue: { info: vi.fn(), warn: vi.fn(), error: vi.fn() } },
       ],
     }).compile();
 

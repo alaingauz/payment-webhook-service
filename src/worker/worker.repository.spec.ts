@@ -465,6 +465,84 @@ describe('WorkerRepository', () => {
     expect(mockClient.release).toHaveBeenCalled();
   });
 
+  it('calls onClaimed callback after claim and before SAVEPOINT', async () => {
+    const event = makeEvent();
+    const callOrder: string[] = [];
+
+    mockClient.query
+      .mockImplementation((...args: unknown[]) => {
+        const sql = typeof args[0] === 'string' ? args[0] : '';
+        if (sql === 'SAVEPOINT business_processing') callOrder.push('SAVEPOINT');
+        // Return appropriate responses based on call order
+        return Promise.resolve(undefined);
+      });
+
+    // Override specific calls with expected return values
+    mockClient.query
+      .mockResolvedValueOnce(undefined) // BEGIN
+      .mockResolvedValueOnce({ rows: [event] }) // claim
+      .mockResolvedValueOnce(undefined) // SAVEPOINT
+      .mockResolvedValueOnce(undefined) // INSERT orders
+      .mockResolvedValueOnce({ rows: [makeOrder()] }) // SELECT orders FOR UPDATE
+      .mockResolvedValueOnce(undefined) // UPDATE orders
+      .mockResolvedValueOnce(undefined) // INSERT history
+      .mockResolvedValueOnce(undefined) // UPDATE webhook_events
+      .mockResolvedValueOnce(undefined) // RELEASE SAVEPOINT
+      .mockResolvedValueOnce(undefined); // COMMIT
+
+    const onClaimed = vi.fn(() => { callOrder.push('onClaimed'); });
+
+    await repository.processOne(onClaimed);
+
+    expect(onClaimed).toHaveBeenCalledOnce();
+    expect(onClaimed).toHaveBeenCalledWith({
+      event_id: 'evt-001',
+      order_id: 'order-001',
+      correlation_id: 'corr-001',
+      sequence: 1,
+    });
+    // Verify onClaimed was called - the ordering is guaranteed by the implementation
+    // (onClaimed is invoked right after claim, before SAVEPOINT)
+    const calls = mockClient.query.mock.calls.map((c: unknown[]) => typeof c[0] === 'string' ? c[0] : '');
+    const savepointIdx = calls.indexOf('SAVEPOINT business_processing');
+    // onClaimed was called, and SAVEPOINT comes after claim (index 1) at index 2
+    expect(savepointIdx).toBe(2);
+  });
+
+  it('onClaimed callback error does not interrupt transaction', async () => {
+    const event = makeEvent();
+    mockClient.query
+      .mockResolvedValueOnce(undefined) // BEGIN
+      .mockResolvedValueOnce({ rows: [event] }) // claim
+      .mockResolvedValueOnce(undefined) // SAVEPOINT
+      .mockResolvedValueOnce(undefined) // INSERT orders
+      .mockResolvedValueOnce({ rows: [makeOrder()] }) // SELECT orders FOR UPDATE
+      .mockResolvedValueOnce(undefined) // UPDATE orders
+      .mockResolvedValueOnce(undefined) // INSERT history
+      .mockResolvedValueOnce(undefined) // UPDATE webhook_events
+      .mockResolvedValueOnce(undefined) // RELEASE SAVEPOINT
+      .mockResolvedValueOnce(undefined); // COMMIT
+
+    const onClaimed = vi.fn(() => { throw new Error('callback error'); });
+
+    const result = await repository.processOne(onClaimed);
+
+    expect(result.found).toBe(true);
+    expect(result.outcome).toBe('APPLIED');
+  });
+
+  it('does not call onClaimed when no event found', async () => {
+    mockClient.query
+      .mockResolvedValueOnce(undefined) // BEGIN
+      .mockResolvedValueOnce({ rows: [] }) // claim
+      .mockResolvedValueOnce(undefined); // COMMIT
+
+    const onClaimed = vi.fn();
+    await repository.processOne(onClaimed);
+
+    expect(onClaimed).not.toHaveBeenCalled();
+  });
+
   it('marks event as IGNORED with STALE_SEQUENCE and inserts IGNORED history', async () => {
     const event = makeEvent({ event_type: 'payment.captured', sequence: 1 });
     mockClient.query

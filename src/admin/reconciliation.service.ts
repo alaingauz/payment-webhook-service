@@ -1,4 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
+import { StructuredLogger } from '../logging/structured-logger.js';
 import {
   ProviderClient,
   ProviderTimeoutError,
@@ -38,6 +39,7 @@ export class ReconciliationService {
   constructor(
     private readonly providerClient: ProviderClient,
     private readonly reconciliationRepository: ReconciliationRepository,
+    private readonly structuredLogger: StructuredLogger,
   ) {}
 
   async reconcile(): Promise<ReconciliationRunResult> {
@@ -65,7 +67,17 @@ export class ReconciliationService {
 
     // 2-7. Execute reconciliation within transaction
     try {
-      return await this.reconciliationRepository.executeReconciliation(providerOrders);
+      const result = await this.reconciliationRepository.executeReconciliation(providerOrders);
+
+      this.structuredLogger.info('reconciliation.completed', {
+        run_id: result.run_id,
+        checked: result.orders_checked,
+        repaired: result.repaired,
+        already_ok: result.already_ok,
+        stale_snapshots: result.stale_provider_snapshots,
+      });
+
+      return result;
     } catch (err) {
       this.logger.error(`Database error during reconciliation: ${(err as Error).message}`);
       throw new ReconciliationDatabaseError(

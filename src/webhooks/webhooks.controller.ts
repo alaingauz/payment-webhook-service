@@ -8,10 +8,10 @@ import {
   HttpStatus,
   UsePipes,
   ValidationPipe,
-  Logger,
 } from '@nestjs/common';
 import type { Response } from 'express';
 import { randomUUID } from 'node:crypto';
+import { StructuredLogger } from '../logging/structured-logger.js';
 import { WebhookSignatureGuard } from './guards/webhook-signature.guard.js';
 import { WebhookIngestionService } from './webhook-ingestion.service.js';
 import { PaymentWebhookDto } from './dto/payment-webhook.dto.js';
@@ -19,9 +19,10 @@ import type { WebhookRequest } from './types/webhook-request.js';
 
 @Controller('webhooks')
 export class WebhooksController {
-  private readonly logger = new Logger(WebhooksController.name);
-
-  constructor(private readonly ingestionService: WebhookIngestionService) {}
+  constructor(
+    private readonly ingestionService: WebhookIngestionService,
+    private readonly structuredLogger: StructuredLogger,
+  ) {}
 
   @Post('payments')
   @UseGuards(WebhookSignatureGuard)
@@ -51,6 +52,13 @@ export class WebhooksController {
         receivedAt,
       );
 
+      this.structuredLogger.info('webhook.ingested', {
+        correlation_id: correlationId,
+        event_id: result.event_id,
+        order_id: validatedPayload['order_id'] as string,
+        result: result.result,
+      });
+
       res
         .status(HttpStatus.ACCEPTED)
         .header('X-Correlation-Id', correlationId)
@@ -61,7 +69,12 @@ export class WebhooksController {
           message: result.message,
         });
     } catch (err) {
-      this.logger.error('Ingestion failed', (err as Error).stack);
+      this.structuredLogger.error('webhook.ingestion_failed', {
+        correlation_id: correlationId,
+        event_id: validatedPayload['event_id'] as string | undefined,
+        order_id: validatedPayload['order_id'] as string | undefined,
+        error: err instanceof Error ? err : undefined,
+      });
       res
         .status(HttpStatus.SERVICE_UNAVAILABLE)
         .header('X-Correlation-Id', correlationId)

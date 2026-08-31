@@ -24,6 +24,7 @@
     "verify:worker": "tsx scripts/verify-worker.ts",
     "verify:retries-dlq": "tsx scripts/verify-retries-dlq.ts",
     "verify:reconciliation": "tsx scripts/verify-reconciliation.ts",
+    "verify:observability": "tsx scripts/verify-observability.ts",
     "test:simulator": "node --test provider-simulator/generator.test.js provider-simulator/server.test.js provider-simulator/convergence.test.js",
     "simulate": "node provider-simulator/simulator.js"
   },

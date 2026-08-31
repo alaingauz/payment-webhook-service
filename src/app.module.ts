@@ -6,6 +6,8 @@ import { AppService } from './app.service.js';
 import { databaseConfig } from './config/database.config.js';
 import { DatabaseModule } from './database/database.module.js';
 import { HealthModule } from './health/health.module.js';
+import { LoggingModule } from './logging/logging.module.js';
+import { MetricsModule } from './metrics/metrics.module.js';
 import { OrdersModule } from './orders/orders.module.js';
 import { WebhooksModule } from './webhooks/webhooks.module.js';
 
@@ -16,10 +18,12 @@ import { WebhooksModule } from './webhooks/webhooks.module.js';
       load: [databaseConfig],
     }),
     DatabaseModule,
+    LoggingModule,
     HealthModule,
     WebhooksModule,
     OrdersModule,
     AdminModule,
+    MetricsModule,
   ],
   controllers: [AppController],
   providers: [AppService],

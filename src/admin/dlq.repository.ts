@@ -1,6 +1,7 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
 import pg from 'pg';
 import { PG_POOL } from '../database/database.module.js';
+import { StructuredLogger } from '../logging/structured-logger.js';
 
 const { Pool } = pg;
 
@@ -39,6 +40,7 @@ export class DlqRepository {
 
   constructor(
     @Inject(PG_POOL) private readonly pool: InstanceType<typeof Pool>,
+    private readonly structuredLogger: StructuredLogger,
   ) {}
 
   async list(limit: number, offset: number): Promise<DlqListResult> {
@@ -130,6 +132,11 @@ export class DlqRepository {
           `REPLAYED id=${updated.id} event_id=${updated.event_id} ` +
           `replay_count=${updated.replay_count}`,
         );
+
+        this.structuredLogger.info('dlq.replayed', {
+          event_id: updated.event_id,
+          correlation_id: event.correlation_id,
+        });
 
         return {
           id: updated.id,
