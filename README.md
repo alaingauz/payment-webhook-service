@@ -75,9 +75,6 @@ npm ci
 docker compose up --build -d --scale worker=3
 ```
 
-> El repositorio es privado. Se requiere autenticación de GitHub (SSH o
-> token personal) para clonarlo.
-
 > **Nota:** el servicio `migration` termina con `Exited (0)`. Esto es
 > esperado — ejecuta las migraciones SQL y finaliza exitosamente.
 
